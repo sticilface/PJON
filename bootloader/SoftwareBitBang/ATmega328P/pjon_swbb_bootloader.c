@@ -16,8 +16,10 @@
      (see src/utils/bootloader/PJON_Bootloader.h for the protocol)
    - Announcements to the master while waiting without timeout (fresh
      device, failed application start), with medium access check
-   - Device id and a random serial (generated on the first start) kept in
-     EEPROM, boot guard (watchdog) on every application start
+   - Device id and a random serial (generated on the first start if not
+     written at ISP time) kept in EEPROM
+   - Boot guard: the first start after an update is supervised by the
+     watchdog until the application calls pjon_boot_app_ok()
 
    Not supported: shared mode, MAC, extended length, broadcast, routing,
    receiving while a page is being written (the sender's ping is retried by
@@ -29,9 +31,10 @@
    Entering the bootloader (the BOOTRST fuse makes it run on every reset):
    - Watchdog reset with a valid mailbox set by the application (see
      src/utils/bootloader/PJON_Bootloader.h): active for TIMEOUT_MS.
-   - Watchdog reset by the boot guard (the application did not call
-     pjon_boot_app_ok() within BOOT_GUARD_S seconds): active until a working
-     application is written and started, announcing the failure.
+   - Watchdog reset while the application is pending (updated and not
+     confirmed with pjon_boot_app_ok() within BOOT_GUARD_S seconds): active
+     until a working application is written and started, announcing the
+     failure.
    - External reset (reset pin), if EXTRF_TIMEOUT_MS is not 0: active for
      EXTRF_TIMEOUT_MS. Useful to recover a board whose application does not
      include the hook.
@@ -205,6 +208,7 @@ static uint8_t last_page_ok NOINIT;           // result of the last page write
 static uint8_t device_id NOINIT;
 static uint8_t serial[4] NOINIT;              // copy of the EEPROM serial
 static uint16_t random_state NOINIT;          // random8() state
+static uint8_t flashed NOINIT;                // a page was written
 
 #define NO_PAGE 0xFFFF
 
@@ -419,8 +423,12 @@ static void load_serial(void) {
     for(uint8_t i = 0; i < 4; i++, mix >>= 8)
       eeprom_update_byte(EEPROM_SERIAL + i, mix);
   }
-  for(uint8_t i = 0; i < 4; i++) serial[i] = eeprom_read_byte(EEPROM_SERIAL + i);
-  random_state = *(uint16_t *)serial ^ *(uint16_t *)(serial + 2);
+  uint32_t mix = 0;
+  for(uint8_t i = 0; i < 4; i++) {
+    serial[i] = eeprom_read_byte(EEPROM_SERIAL + i);
+    mix = crc32_update(mix, serial[i]);
+  }
+  random_state = mix; // different serials give different delays
 }
 
 /* Flash ------------------------------------------------------------------- */
@@ -477,6 +485,7 @@ static void finish_page(void) {
     (page_address != NO_PAGE) &&
     (next_chunk == PJON_BOOT_CHUNKS_PER_PAGE) &&
     write_page(page_address, page);
+  flashed |= last_page_ok;
 }
 
 /* Application ------------------------------------------------------------- */
@@ -485,9 +494,15 @@ static uint8_t app_present(void) {
   return pgm_read_word(0) != 0xFFFF;
 }
 
-/* Starts the application if present, otherwise returns. With the boot guard
-   the watchdog is left running: the application must call
-   pjon_boot_app_ok() before it expires. */
+#define EEPROM_FLAG ((uint8_t *)PJON_BOOT_EEPROM_FLAG_ADDR)
+
+static uint8_t app_pending(void) {
+  return eeprom_read_byte(EEPROM_FLAG) == PJON_BOOT_FLAG_PENDING;
+}
+
+/* Starts the application if present, otherwise returns. If the application
+   is pending (updated, not confirmed yet) the watchdog is left running: the
+   application must call pjon_boot_app_ok() before it expires. */
 static void start_app(void) {
   if(!app_present()) return;
   TCCR1B = 0;
@@ -495,9 +510,7 @@ static void start_app(void) {
   TIFR1 = 0xFF;
   BUS_RELEASE();
 #if BOOT_GUARD_S
-  PJON_BOOT_MAILBOX[1] = PJON_BOOT_MAGIC_GUARD;
-  PJON_BOOT_MAILBOX[0] = PJON_BOOT_MAGIC_0;
-  wdt_enable(BOOT_GUARD_WDTO);
+  if(app_pending()) wdt_enable(BOOT_GUARD_WDTO);
 #endif
   __asm__ __volatile__ ("jmp 0");
 }
@@ -522,6 +535,7 @@ int main(void) {
   uint8_t reason = 0;   // announcement reason, 0 = do not announce
   page_address = NO_PAGE;
   last_page_ok = 1;
+  flashed = 0;
   device_id = eeprom_read_byte((const uint8_t *)PJON_BOOT_EEPROM_ID_ADDR);
   if(!device_id || (device_id > 253)) device_id = DEVICE_ID;
   uint8_t watchdog = (reset_flags & (1 << WDRF)) &&
@@ -529,9 +543,11 @@ int main(void) {
   if(watchdog && (magic_1 == PJON_BOOT_MAGIC_ENTER)) {
     if(id && (id < 254)) device_id = id;
     timeout = OVERFLOWS(TIMEOUT_MS);
-  } else if(watchdog && (magic_1 == PJON_BOOT_MAGIC_GUARD)) {
-    reason = PJON_BOOT_REASON_BOOT_FAILED;
   }
+#if BOOT_GUARD_S
+  else if((reset_flags & (1 << WDRF)) && app_pending())
+    reason = PJON_BOOT_REASON_BOOT_FAILED; // stays, without timeout
+#endif
 #if EXTRF_TIMEOUT_MS
   else if(reset_flags & (1 << EXTRF)) timeout = OVERFLOWS(EXTRF_TIMEOUT_MS);
 #endif
@@ -612,6 +628,11 @@ int main(void) {
     else if(ok == 3) { // Assign: save the id after the acknowledgement
       device_id = payload[5];
       eeprom_update_byte((uint8_t *)PJON_BOOT_EEPROM_ID_ADDR, device_id);
-    } else if(payload[0] == PJON_BOOT_CMD_GO) start_app();
+    } else if(payload[0] == PJON_BOOT_CMD_GO) {
+#if BOOT_GUARD_S
+      if(flashed) eeprom_update_byte(EEPROM_FLAG, PJON_BOOT_FLAG_PENDING);
+#endif
+      start_app();
+    }
   }
 }

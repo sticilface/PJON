@@ -68,11 +68,16 @@
    received for TIMEOUT_MS (set when building the bootloader) the
    application is started again.
 
-   Boot guard: the bootloader starts the application with the watchdog
-   enabled (BOOT_GUARD_S seconds, set when building the bootloader). The
-   application must call pjon_boot_app_ok() within that time, otherwise the
-   watchdog resets the device and the bootloader stays active and announces
-   the failure, so the master can flash a working application.
+   Boot guard: after an update ('G' after pages were written) the
+   bootloader marks the new application as "pending" in EEPROM and starts
+   it with the watchdog enabled (BOOT_GUARD_S seconds, set when building
+   the bootloader). The application must call pjon_boot_app_ok() within
+   that time: it disables the watchdog and clears the mark (one EEPROM
+   write per update). Otherwise the watchdog resets the device and the
+   bootloader stays active and announces the failure, so the master can
+   flash a working application. Once confirmed, the application starts
+   normally, without watchdog. The mark is kept in EEPROM because SRAM is
+   overwritten by the application's stack.
    ___________________________________________________________________________
 
    Licensed under the Apache License, Version 2.0 (the "License");
@@ -126,13 +131,16 @@
 /* Assign payload: 'I' serial[4] id */
 #define PJON_BOOT_ASSIGN_LENGTH    6
 
-/* EEPROM layout: device id (1 byte) followed by the serial (4 bytes). The
-   default is the end of the 1kB EEPROM. Bootloader and application must
-   use the same address. 0xFF (erased) means not set. */
+/* EEPROM layout: boot guard flag (1 byte), device id (1 byte), serial
+   (4 bytes). The default is the end of the 1kB EEPROM (1018-1023), the
+   application must not use these bytes for other purposes. Bootloader and
+   application must use the same address. 0xFF (erased) means not set. */
 #ifndef PJON_BOOT_EEPROM_ID_ADDR
   #define PJON_BOOT_EEPROM_ID_ADDR     1019
 #endif
+#define PJON_BOOT_EEPROM_FLAG_ADDR     (PJON_BOOT_EEPROM_ID_ADDR - 1)
 #define PJON_BOOT_EEPROM_SERIAL_ADDR   (PJON_BOOT_EEPROM_ID_ADDR + 1)
+#define PJON_BOOT_FLAG_PENDING         0x5A  // new app not confirmed yet
 
 /* Flash page size of the ATmega328P in bytes */
 #define PJON_BOOT_PAGE_SIZE      128
@@ -159,10 +167,10 @@
    length, CRC8, sender id, packet id (2), port (2), CRC32 (4) */
 #define PJON_BOOT_MAX_OVERHEAD   13
 
-/* Mailbox (3 bytes at the top of SRAM, survives a watchdog reset) */
+/* Mailbox (3 bytes at the top of SRAM, survives a watchdog reset), written
+   by pjon_boot_enter() right before the reset */
 #define PJON_BOOT_MAGIC_0        0xB0
-#define PJON_BOOT_MAGIC_ENTER    0x07  // [2] = device id, set by the app
-#define PJON_BOOT_MAGIC_GUARD    0x0D  // set by the bootloader, boot guard
+#define PJON_BOOT_MAGIC_ENTER    0x07  // [2] = device id
 #define PJON_BOOT_MAILBOX_SIZE   3
 
 #if defined(__AVR__)
@@ -175,13 +183,18 @@
   #define PJON_BOOT_MAILBOX \
     ((volatile uint8_t *)(RAMEND - (PJON_BOOT_MAILBOX_SIZE - 1)))
 
-  /* Call from the application, as early as possible once it works (e.g. at
-     the end of setup()), to confirm its start: disables the boot guard
-     watchdog. The application may enable the watchdog again for its own use
-     afterwards. Harmless if the bootloader was built without boot guard. */
+  /* Call from the application once it works (e.g. at the end of setup(),
+     or after its first successful exchange on the bus) to confirm its start
+     after an update: disables the boot guard watchdog and clears the
+     pending mark. Call it on every start, it writes the EEPROM only after
+     an update. The application may enable the watchdog again for its own
+     use afterwards. */
   static inline void pjon_boot_app_ok(void) {
-    wdt_disable();
-    PJON_BOOT_MAILBOX[0] = 0;
+    uint8_t *flag = (uint8_t *)PJON_BOOT_EEPROM_FLAG_ADDR;
+    if(eeprom_read_byte(flag) == PJON_BOOT_FLAG_PENDING) {
+      wdt_disable();
+      eeprom_write_byte(flag, 0xFF);
+    }
   };
 
   /* Device id saved in EEPROM by the bootloader ('I' command), or fallback

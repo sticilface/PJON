@@ -15,6 +15,13 @@
    If the bytes of a request are more than 250ms apart the request is
    discarded, so the PC can always resynchronize.
 
+   Packets received on the bootloader port (announcements of devices waiting
+   in the bootloader) are forwarded to the PC at any time, also between a
+   request and its answer:
+     Uploader -> PC: '#' [sender id] [length] [length bytes of payload]
+   The Uploader uses id PJON_BOOT_MASTER_ID (254), the id bootloaders
+   announce themselves to.
+
    The bootloader acknowledges every packet quickly (pages are confirmed by
    a ping sent after them), so default PJON settings work: with the default
    chunk size of 32 bytes the longest packet is 48 bytes. Only a chunk size
@@ -39,12 +46,25 @@
 #endif
 #define SERIAL_TIMEOUT_MS 250
 
-PJONSoftwareBitBang bus(PJON_MASTER_ID);
+PJONSoftwareBitBang bus(PJON_BOOT_MASTER_ID);
 
 uint8_t request[2 + PJON_BOOT_WRITE_LENGTH];
 uint16_t received = 0;
 uint32_t last_byte_time = 0;
 uint16_t packet_id = 1;
+
+/* Forwards packets on the bootloader port to the PC */
+void receiver_function(
+  uint8_t *payload,
+  uint16_t length,
+  const PJON_Packet_Info &info
+) {
+  if((info.port != PJON_BOOT_PORT) || (length > 255)) return;
+  Serial.write('#');
+  Serial.write(info.tx.id);
+  Serial.write((uint8_t)length);
+  for(uint16_t i = 0; i < length; i++) Serial.write(payload[i]);
+};
 
 void setup() {
   bus.strategy.set_pin(BUS_PIN);
@@ -52,11 +72,13 @@ void setup() {
   #if PJON_INCLUDE_PACKET_ID
     bus.set_packet_id(true);
   #endif
+  bus.set_receiver(receiver_function);
   bus.begin();
   Serial.begin(115200);
 };
 
 void loop() {
+  bus.receive(1000);
   while(Serial.available()) {
     if(received && ((uint32_t)(millis() - last_byte_time) > SERIAL_TIMEOUT_MS))
       received = 0;
