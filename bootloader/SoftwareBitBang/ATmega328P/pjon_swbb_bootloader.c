@@ -12,23 +12,31 @@
    - CRC32 packet verification (covers meta-data, the CRC8 is not checked)
    - Optional sender info and packet id (skipped), port PJON_BOOT_PORT
    - Commands: ping, write a page chunk (the page is erased, written and
-     verified after its last chunk), start application (see
-     src/utils/bootloader/PJON_Bootloader.h for the protocol)
+     verified after its last chunk), start application, assign device id
+     (see src/utils/bootloader/PJON_Bootloader.h for the protocol)
+   - Announcements to the master while waiting without timeout (fresh
+     device, failed application start), with medium access check
+   - Device id and a random serial (generated on the first start) kept in
+     EEPROM, boot guard (watchdog) on every application start
 
    Not supported: shared mode, MAC, extended length, broadcast, routing,
-   transmitting packets and medium access (it never starts a transmission,
-   it only answers with an acknowledgement), receiving while a page is being
-   written (the sender's ping is retried by PJON until the write is over).
+   receiving while a page is being written (the sender's ping is retried by
+   PJON until the write is over).
+
+   Device id: the id passed by the application (bootloader request), else
+   the id saved in EEPROM, else DEVICE_ID (default 255, not assigned).
 
    Entering the bootloader (the BOOTRST fuse makes it run on every reset):
    - Watchdog reset with a valid mailbox set by the application (see
-     src/utils/bootloader/PJON_Bootloader.h): active for TIMEOUT_MS,
-     answering to the device id passed by the application.
+     src/utils/bootloader/PJON_Bootloader.h): active for TIMEOUT_MS.
+   - Watchdog reset by the boot guard (the application did not call
+     pjon_boot_app_ok() within BOOT_GUARD_S seconds): active until a working
+     application is written and started, announcing the failure.
    - External reset (reset pin), if EXTRF_TIMEOUT_MS is not 0: active for
-     EXTRF_TIMEOUT_MS answering to DEVICE_ID. Useful to recover a board
-     whose application does not include the hook.
+     EXTRF_TIMEOUT_MS. Useful to recover a board whose application does not
+     include the hook.
    - No application in flash (erased reset vector): active until a valid
-     application is written and started.
+     application is written and started, announcing itself.
    - Any other reset (power on, brown out, plain watchdog reset): the
      application is started immediately.
 
@@ -52,6 +60,7 @@
 #include <avr/boot.h>
 #include <avr/pgmspace.h>
 #include <avr/wdt.h>
+#include <avr/eeprom.h>
 #include <stdint.h>
 
 #include "utils/bootloader/PJON_Bootloader.h"
@@ -61,8 +70,8 @@
 #ifndef PJON_PIN          // Arduino pin number of the bus (0-19, A0 = 14)
   #define PJON_PIN       12
 #endif
-#ifndef DEVICE_ID         // Id used if the application does not pass one
-  #define DEVICE_ID      44
+#ifndef DEVICE_ID         // Id used if none is passed or saved in EEPROM
+  #define DEVICE_ID      PJON_BOOT_UNASSIGNED
 #endif
 #ifndef MODE              // PJDL mode 1, 2, 3 or 4
   #define MODE            1
@@ -76,6 +85,27 @@
 #ifndef BOOT_START        // Byte address of the bootloader section
   #define BOOT_START 0x7800
 #endif
+#ifndef BOOT_GUARD_S      // Seconds the app has to call pjon_boot_app_ok()
+  #define BOOT_GUARD_S    8  // 0 (off), 1, 2, 4 or 8
+#endif
+
+#if BOOT_GUARD_S == 1
+  #define BOOT_GUARD_WDTO WDTO_1S
+#elif BOOT_GUARD_S == 2
+  #define BOOT_GUARD_WDTO WDTO_2S
+#elif BOOT_GUARD_S == 4
+  #define BOOT_GUARD_WDTO WDTO_4S
+#elif BOOT_GUARD_S == 8
+  #define BOOT_GUARD_WDTO WDTO_8S
+#elif BOOT_GUARD_S != 0
+  #error "BOOT_GUARD_S must be 0, 1, 2, 4 or 8"
+#endif
+
+/* Announcements: first one within ~1s, then every 5s doubling up to 60s,
+   plus up to ~1s of random jitter. A valid command postpones the next one
+   by ANNOUNCE_MAX_MS. */
+#define ANNOUNCE_FIRST_MS  5000
+#define ANNOUNCE_MAX_MS   60000
 
 /* Pin mapping (Arduino numbering, ATmega328P) ----------------------------- */
 
@@ -167,37 +197,51 @@
 /* Not initialized: there is no C runtime startup code (-nostartfiles),
    main() assigns the variables that need an initial value. */
 #define NOINIT __attribute__((section(".noinit")))
-static uint8_t buffer[BUFFER_LENGTH] NOINIT;  // received packet
+static uint8_t buffer[BUFFER_LENGTH] NOINIT;  // received or sent packet
 static uint8_t page[SPM_PAGESIZE] NOINIT;     // page being assembled
 static uint16_t page_address NOINIT;          // its address, NO_PAGE if none
 static uint8_t next_chunk NOINIT;             // chunks received in order
 static uint8_t last_page_ok NOINIT;           // result of the last page write
 static uint8_t device_id NOINIT;
+static uint8_t serial[4] NOINIT;              // copy of the EEPROM serial
+static uint16_t random_state NOINIT;          // random8() state
 
 #define NO_PAGE 0xFFFF
 
 /* Error detection --------------------------------------------------------- */
 
-/* CRC32 (PJON, IEEE 802.3) using a 16 entries table. It is updated while
-   the frame is received, one byte at a time at the start of the next padding
-   bit (~6us at 16MHz, ~12us at 8MHz, shorter than any padding bit minus
+/* CRC32 (PJON, IEEE 802.3), bit by bit. It is updated while the frame is
+   received, one byte at a time at the start of the next padding bit (~110
+   cycles: ~7us at 16MHz, ~14us at 8MHz, shorter than any padding bit minus
    ACC_US), so the acknowledgement can be sent right after the frame, well
    within the default PJON response timeout. */
-/* In a .text section rather than PROGMEM: the linker places PROGMEM data
-   before main(), which must stay at the reset address (BOOT_START) */
-static const uint32_t crc32_table[16]
-  __attribute__((used, section(".text.crc32_table"))) = {
-  0x00000000UL, 0x1DB71064UL, 0x3B6E20C8UL, 0x26D930ACUL,
-  0x76DC4190UL, 0x6B6B51F4UL, 0x4DB26158UL, 0x5005713CUL,
-  0xEDB88320UL, 0xF00F9344UL, 0xD6D6A3E8UL, 0xCB61B38CUL,
-  0x9B64C2B0UL, 0x86D3D2D4UL, 0xA00AE278UL, 0xBDBDF21CUL
-};
-
 static uint32_t crc32_update(uint32_t crc, uint8_t b) {
   crc ^= b;
-  crc = (crc >> 4) ^ pgm_read_dword(&crc32_table[crc & 15]);
-  crc = (crc >> 4) ^ pgm_read_dword(&crc32_table[crc & 15]);
+  for(uint8_t i = 8; i; i--)
+    crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320UL : 0);
   return crc;
+}
+
+/* Meta-data CRC8 of the packets sent by the bootloader (PJON CRC8 C2) */
+static uint8_t crc8(const uint8_t *data, uint8_t length) {
+  uint8_t crc = 0;
+  while(length--) {
+    uint8_t b = *data++;
+    for(uint8_t i = 8; i; i--, b >>= 1) {
+      uint8_t mix = (crc ^ b) & 1;
+      crc >>= 1;
+      if(mix) crc ^= 0x97;
+    }
+  }
+  return crc;
+}
+
+/* 16 bits linear congruential generator, seeded with the serial: devices
+   pick different delays even if they start at the same time. Only the
+   high byte is used. */
+static uint8_t random8(void) {
+  random_state = random_state * 25173 + 13849;
+  return random_state >> 8;
 }
 
 /* SoftwareBitBang reception ----------------------------------------------- */
@@ -262,7 +306,7 @@ static uint8_t receive_frame(uint32_t *crc) {
   return length;
 }
 
-/* SoftwareBitBang synchronous acknowledgement ----------------------------- */
+/* SoftwareBitBang transmission ------------------------------------------- */
 
 static void send_pad(void) {
   BUS_SET();
@@ -270,6 +314,17 @@ static void send_pad(void) {
   __builtin_avr_delay_cycles(CYCLES_PAD);
   BUS_CLEAR();
   __builtin_avr_delay_cycles(CYCLES_BIT);
+}
+
+/* Synchronization pad then 8 bits LSB first */
+static void send_byte(uint8_t value) {
+  send_pad();
+  for(uint8_t i = 8; i; i--) {
+    if(value & 1) BUS_SET();
+    else BUS_CLEAR();
+    value >>= 1;
+    __builtin_avr_delay_cycles(CYCLES_BIT - 8); // minus loop overhead
+  }
 }
 
 /* The transmitter keeps the bus busy with short high pulses while waiting:
@@ -282,20 +337,90 @@ static void send_pad(void) {
 #define PULSE_WAIT_US    100
 static void send_ack(void) {
   uint16_t start = TCNT1;
-  uint8_t value = PJON_ACK, i;
   while(!BUS_HIGH() && ((uint16_t)(TCNT1 - start) < TICKS(PULSE_WAIT_US)));
   start = TCNT1;
   while(BUS_HIGH() && ((uint16_t)(TCNT1 - start) < TICKS(BIT_US / 2)));
   __builtin_avr_delay_cycles(CYCLES(RESPONSE_DELAY_US));
   send_pad();
-  send_pad();
-  for(i = 8; i; i--) {
-    if(value & 1) BUS_SET();
-    else BUS_CLEAR();
-    value >>= 1;
-    __builtin_avr_delay_cycles(CYCLES_BIT - 8); // minus loop overhead
-  }
+  send_byte(PJON_ACK);
   BUS_RELEASE();
+}
+
+/* Waits for the synchronous acknowledgement of a frame just sent: keeps
+   the bus busy with short pulses, the receiver answers after the falling
+   edge of one of them with 2 synchronization pads and PJON_ACK. */
+#define ACK_TIMEOUT_US 4000
+static uint8_t receive_ack(void) {
+  uint16_t start = TCNT1;
+  while((uint16_t)(TCNT1 - start) < TICKS(ACK_TIMEOUT_US)) {
+    BUS_SET();
+    BUS_DRIVE();
+    __builtin_avr_delay_cycles(CYCLES_BIT / 4);
+    BUS_RELEASE();
+    if(sync() && sync()) return read_byte() == PJON_ACK;
+  }
+  return 0;
+}
+
+/* Announces the bootloader to the master. Returns 0 if the bus is busy (try
+   again soon), 1 if the announcement was not acknowledged, 2 if it was. */
+static uint8_t announce(uint8_t reason) {
+  /* Medium access: the bus must stay low for a padding bit, 10 data bits
+     and a random time (a byte cannot be shorter) */
+  uint16_t start = TCNT1;
+  uint16_t wait = TICKS(PAD_US + 10 * BIT_US) + (random8() & 127);
+  while((uint16_t)(TCNT1 - start) < wait) if(BUS_HIGH()) return 0;
+  uint8_t *p = buffer;
+  *p++ = PJON_BOOT_MASTER_ID;
+  *p++ = PJON_TX_INFO_BIT | PJON_ACK_REQ_BIT | PJON_PORT_BIT | PJON_CRC_BIT;
+  *p++ = 4 + 1 + 2 + PJON_BOOT_ANNOUNCE_LENGTH + 4;
+  *p = crc8(buffer, 3);
+  p++;
+  *p++ = device_id;
+  *p++ = (uint8_t)(PJON_BOOT_PORT >> 8);
+  *p++ = (uint8_t)PJON_BOOT_PORT;
+  *p++ = PJON_BOOT_CMD_ANNOUNCE;
+  *p++ = reason;
+  for(uint8_t i = 0; i < 4; i++) *p++ = serial[i];
+  *p++ = PJON_BOOT_VERSION;
+  *p++ = PJON_BOOT_CHUNK_SIZE;
+  uint32_t crc = 0xFFFFFFFF;
+  for(uint8_t *q = buffer; q < p; q++) crc = crc32_update(crc, *q);
+  crc = ~crc;
+  for(int8_t shift = 24; shift >= 0; shift -= 8) *p++ = crc >> shift;
+  send_pad(); // frame initializer: 3 synchronization pads
+  send_pad();
+  send_pad();
+  for(uint8_t *q = buffer; q < p; q++) send_byte(*q);
+  BUS_RELEASE();
+  return receive_ack() + 1;
+}
+
+/* EEPROM ------------------------------------------------------------------ */
+
+/* Loads the serial from EEPROM. On the first start (erased EEPROM) a random
+   serial is generated from the jitter between the watchdog oscillator and
+   the CPU clock, and saved. The first byte of a serial is never 0xFF. */
+#define EEPROM_SERIAL ((uint8_t *)PJON_BOOT_EEPROM_SERIAL_ADDR)
+static void load_serial(void) {
+  if(eeprom_read_byte(EEPROM_SERIAL) == 0xFF) {
+    uint32_t mix = 0;
+    TCCR1B = (1 << CS10); // F_CPU
+    WDTCSR = (1 << WDCE) | (1 << WDE);
+    WDTCSR = (1 << WDIE); // 16ms, interrupt mode (interrupts stay off)
+    for(uint8_t n = 32; n; n--) {
+      while(!(WDTCSR & (1 << WDIF)));
+      WDTCSR = (1 << WDIF) | (1 << WDIE);
+      mix = crc32_update(mix, TCNT1L);
+    }
+    WDTCSR = (1 << WDCE) | (1 << WDE);
+    WDTCSR = 0;
+    mix &= 0xFFFFFF7F;
+    for(uint8_t i = 0; i < 4; i++, mix >>= 8)
+      eeprom_update_byte(EEPROM_SERIAL + i, mix);
+  }
+  for(uint8_t i = 0; i < 4; i++) serial[i] = eeprom_read_byte(EEPROM_SERIAL + i);
+  random_state = *(uint16_t *)serial ^ *(uint16_t *)(serial + 2);
 }
 
 /* Flash ------------------------------------------------------------------- */
@@ -311,6 +436,7 @@ static uint8_t page_matches(uint16_t address, const uint8_t *data) {
 static uint8_t write_page(uint16_t address, const uint8_t *data) {
   if((address & (SPM_PAGESIZE - 1)) || (address >= BOOT_START)) return 0;
   if(page_matches(address, data)) return 1;
+  eeprom_busy_wait(); // SPM is not possible while the EEPROM is written
   boot_page_erase(address);
   boot_spm_busy_wait();
   for(uint8_t i = 0; i < SPM_PAGESIZE; i += 2)
@@ -355,13 +481,24 @@ static void finish_page(void) {
 
 /* Application ------------------------------------------------------------- */
 
-/* Starts the application if present, otherwise returns */
+static uint8_t app_present(void) {
+  return pgm_read_word(0) != 0xFFFF;
+}
+
+/* Starts the application if present, otherwise returns. With the boot guard
+   the watchdog is left running: the application must call
+   pjon_boot_app_ok() before it expires. */
 static void start_app(void) {
-  if(pgm_read_word(0) == 0xFFFF) return;
+  if(!app_present()) return;
   TCCR1B = 0;
   TCNT1 = 0;
   TIFR1 = 0xFF;
   BUS_RELEASE();
+#if BOOT_GUARD_S
+  PJON_BOOT_MAILBOX[1] = PJON_BOOT_MAGIC_GUARD;
+  PJON_BOOT_MAILBOX[0] = PJON_BOOT_MAGIC_0;
+  wdt_enable(BOOT_GUARD_WDTO);
+#endif
   __asm__ __volatile__ ("jmp 0");
 }
 
@@ -381,16 +518,19 @@ int main(void) {
   wdt_disable();
   GPIOR0 = reset_flags;
 
-  uint16_t timeout = 0; // 0 = wait forever (only if there is no app)
-  device_id = DEVICE_ID;
+  uint16_t timeout = 0; // 0 = wait forever
+  uint8_t reason = 0;   // announcement reason, 0 = do not announce
   page_address = NO_PAGE;
   last_page_ok = 1;
-  if(
-    (reset_flags & (1 << WDRF)) &&
-    (magic_0 == PJON_BOOT_MAGIC_0) && (magic_1 == PJON_BOOT_MAGIC_1)
-  ) {
+  device_id = eeprom_read_byte((const uint8_t *)PJON_BOOT_EEPROM_ID_ADDR);
+  if(!device_id || (device_id > 253)) device_id = DEVICE_ID;
+  uint8_t watchdog = (reset_flags & (1 << WDRF)) &&
+    (magic_0 == PJON_BOOT_MAGIC_0);
+  if(watchdog && (magic_1 == PJON_BOOT_MAGIC_ENTER)) {
     if(id && (id < 254)) device_id = id;
     timeout = OVERFLOWS(TIMEOUT_MS);
+  } else if(watchdog && (magic_1 == PJON_BOOT_MAGIC_GUARD)) {
+    reason = PJON_BOOT_REASON_BOOT_FAILED;
   }
 #if EXTRF_TIMEOUT_MS
   else if(reset_flags & (1 << EXTRF)) timeout = OVERFLOWS(EXTRF_TIMEOUT_MS);
@@ -399,8 +539,11 @@ int main(void) {
 
   BUS_RELEASE();
   TCCR1A = 0;
+  load_serial();
   TCCR1B = (1 << CS11); // F_CPU / 8
   uint16_t remaining = timeout;
+  uint16_t interval = OVERFLOWS(ANNOUNCE_FIRST_MS);
+  uint16_t next_announce = 1 + (random8() & 31);
 
   for(;;) {
     if(TIFR1 & (1 << TOV1)) {
@@ -409,8 +552,23 @@ int main(void) {
         start_app();
         remaining = timeout; // No application, keep waiting
       }
+      if(next_announce) next_announce--;
     }
-    if(!BUS_HIGH()) continue;
+    if(!BUS_HIGH()) {
+      if(next_announce) continue;
+      if(!reason && app_present()) {
+        next_announce = OVERFLOWS(ANNOUNCE_MAX_MS);
+        continue;
+      }
+      uint8_t result = announce(reason ? reason : PJON_BOOT_REASON_NO_APP);
+      if(!result) next_announce = 1 + (random8() & 15); // bus busy
+      else {
+        next_announce = interval + (random8() & 31);
+        if(interval < OVERFLOWS(ANNOUNCE_MAX_MS) / 2) interval <<= 1;
+        else interval = OVERFLOWS(ANNOUNCE_MAX_MS);
+      }
+      continue;
+    }
     /* The meta-data CRC8 is not checked: the CRC32 covers the whole packet
        (meta-data and CRC8 included) and the length is already bounded */
     uint32_t crc;
@@ -439,10 +597,21 @@ int main(void) {
       (payload_length == PJON_BOOT_WRITE_LENGTH) &&
       (payload[0] == PJON_BOOT_CMD_WRITE)
     ) ok = store_chunk((payload[1] << 8) | payload[2], payload + 3);
+    else if(
+      (payload_length == PJON_BOOT_ASSIGN_LENGTH) &&
+      (payload[0] == PJON_BOOT_CMD_ASSIGN) &&
+      (payload[1] == serial[0]) && (payload[2] == serial[1]) &&
+      (payload[3] == serial[2]) && (payload[4] == serial[3]) &&
+      payload[5] && (payload[5] < 254)
+    ) ok = 3;
     if(!ok) continue; // No acknowledgement, the sender will retry
     if(header & PJON_ACK_REQ_BIT) send_ack();
     remaining = timeout;
+    next_announce = OVERFLOWS(ANNOUNCE_MAX_MS); // the master is here
     if(ok == 2) finish_page(); // After the acknowledgement: no long wait
-    else if(payload[0] == PJON_BOOT_CMD_GO) start_app();
+    else if(ok == 3) { // Assign: save the id after the acknowledgement
+      device_id = payload[5];
+      eeprom_update_byte((uint8_t *)PJON_BOOT_EEPROM_ID_ADDR, device_id);
+    } else if(payload[0] == PJON_BOOT_CMD_GO) start_app();
   }
 }

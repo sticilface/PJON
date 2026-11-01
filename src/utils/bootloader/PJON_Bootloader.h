@@ -3,8 +3,8 @@
 
    This header is shared by:
    - the bootloader itself (bootloader/SoftwareBitBang/ATmega328P)
-   - the application running on the target (to jump into the bootloader)
-   - the uploader (the device that sends the firmware over PJON)
+   - the application running on the target
+   - the uploader / server (the device that sends the firmware over PJON)
 
    It is plain C so the bootloader can include it without the PJON library.
 
@@ -32,6 +32,23 @@
                                     out of order chunk makes the page fail.
      'G'                         -> start the application: acknowledged only
                                     if the last page is correct
+     'I' serial[4] id            -> assign a device id: accepted (and
+                                    acknowledged) only if serial is the
+                                    device's serial. The id is saved in EEPROM.
+                                    Unprovisioned devices answer to id 255
+                                    (PJON_NOT_ASSIGNED), the serial selects one
+                                    of them.
+
+   Bootloader -> master (PJON_BOOT_MASTER_ID, acknowledgement requested):
+     'b' reason serial[4] version chunk_size
+                                 -> announcement, sent from the device's id
+                                    (255 if unprovisioned) while the
+                                    bootloader waits without timeout: no
+                                    application in flash, or the application
+                                    did not confirm its start (boot guard).
+                                    Repeated every 5s, doubling up to 60s,
+                                    with random jitter; postponed by any
+                                    valid command.
 
    Writing a page: send its chunks, then a ping. The ping is not answered
    while the page is being written (PJON retries), and is answered only if
@@ -39,13 +56,23 @@
    This keeps every acknowledgement fast, so senders can use the default
    SWBB_RESPONSE_OFFSET and PJON_PACKET_MAX_LENGTH (chunk size 32).
 
+   Fresh install: the bootloader generates a random serial on its first
+   start and saves it in EEPROM, announces itself from id 255, the master
+   assigns an id with 'I' and flashes the application on that id.
+
    How the application enters the bootloader:
    The application writes a 3 bytes "mailbox" (magic + its own device id) at
    the top of SRAM and triggers a watchdog reset. SRAM survives a watchdog
    reset, so the bootloader finds the mailbox, clears it, and stays active
    using the same device id the application was using. If no command is
-   received for PJON_BOOT_TIMEOUT_MS (set when building the bootloader) the
+   received for TIMEOUT_MS (set when building the bootloader) the
    application is started again.
+
+   Boot guard: the bootloader starts the application with the watchdog
+   enabled (BOOT_GUARD_S seconds, set when building the bootloader). The
+   application must call pjon_boot_app_ok() within that time, otherwise the
+   watchdog resets the device and the bootloader stays active and announces
+   the failure, so the master can flash a working application.
    ___________________________________________________________________________
 
    Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,11 +96,43 @@
   #define PJON_BOOT_PORT         45063
 #endif
 
+/* Device the bootloader announces itself to */
+#ifndef PJON_BOOT_MASTER_ID
+  #define PJON_BOOT_MASTER_ID    254
+#endif
+
+/* Id of a device that has not been provisioned yet */
+#define PJON_BOOT_UNASSIGNED     255
+
 /* Commands (first payload byte) */
 #define PJON_BOOT_CMD_ENTER      'B'
 #define PJON_BOOT_CMD_PING       'P'
 #define PJON_BOOT_CMD_WRITE      'W'
 #define PJON_BOOT_CMD_GO         'G'
+#define PJON_BOOT_CMD_ASSIGN     'I'
+#define PJON_BOOT_CMD_ANNOUNCE   'b'
+/* Suggested command for applications: show which device this is (e.g. blink
+   a LED). Not handled by the bootloader. */
+#define PJON_BOOT_CMD_IDENTIFY   'Y'
+
+/* Announcement reasons */
+#define PJON_BOOT_REASON_NO_APP      1  // no application in flash
+#define PJON_BOOT_REASON_BOOT_FAILED 2  // application did not confirm
+
+/* Announcement payload: 'b' reason serial[4] version chunk_size */
+#define PJON_BOOT_ANNOUNCE_LENGTH  8
+#define PJON_BOOT_VERSION          2
+
+/* Assign payload: 'I' serial[4] id */
+#define PJON_BOOT_ASSIGN_LENGTH    6
+
+/* EEPROM layout: device id (1 byte) followed by the serial (4 bytes). The
+   default is the end of the 1kB EEPROM. Bootloader and application must
+   use the same address. 0xFF (erased) means not set. */
+#ifndef PJON_BOOT_EEPROM_ID_ADDR
+  #define PJON_BOOT_EEPROM_ID_ADDR     1019
+#endif
+#define PJON_BOOT_EEPROM_SERIAL_ADDR   (PJON_BOOT_EEPROM_ID_ADDR + 1)
 
 /* Flash page size of the ATmega328P in bytes */
 #define PJON_BOOT_PAGE_SIZE      128
@@ -100,19 +159,44 @@
    length, CRC8, sender id, packet id (2), port (2), CRC32 (4) */
 #define PJON_BOOT_MAX_OVERHEAD   13
 
-/* Mailbox used to pass the request from application to bootloader */
+/* Mailbox (3 bytes at the top of SRAM, survives a watchdog reset) */
 #define PJON_BOOT_MAGIC_0        0xB0
-#define PJON_BOOT_MAGIC_1        0x07
+#define PJON_BOOT_MAGIC_ENTER    0x07  // [2] = device id, set by the app
+#define PJON_BOOT_MAGIC_GUARD    0x0D  // set by the bootloader, boot guard
 #define PJON_BOOT_MAILBOX_SIZE   3
 
 #if defined(__AVR__)
   #include <avr/io.h>
   #include <avr/interrupt.h>
   #include <avr/wdt.h>
+  #include <avr/eeprom.h>
 
   /* The mailbox lives in the last bytes of SRAM */
   #define PJON_BOOT_MAILBOX \
     ((volatile uint8_t *)(RAMEND - (PJON_BOOT_MAILBOX_SIZE - 1)))
+
+  /* Call from the application, as early as possible once it works (e.g. at
+     the end of setup()), to confirm its start: disables the boot guard
+     watchdog. The application may enable the watchdog again for its own use
+     afterwards. Harmless if the bootloader was built without boot guard. */
+  static inline void pjon_boot_app_ok(void) {
+    wdt_disable();
+    PJON_BOOT_MAILBOX[0] = 0;
+  };
+
+  /* Device id saved in EEPROM by the bootloader ('I' command), or fallback
+     if the device has not been provisioned. */
+  static inline uint8_t pjon_boot_saved_id(uint8_t fallback) {
+    uint8_t id = eeprom_read_byte((const uint8_t *)PJON_BOOT_EEPROM_ID_ADDR);
+    return (id && (id < PJON_BOOT_UNASSIGNED - 1)) ? id : fallback;
+  };
+
+  /* Reads the device serial (4 bytes) generated by the bootloader */
+  static inline void pjon_boot_serial(uint8_t serial[4]) {
+    eeprom_read_block(
+      serial, (const void *)PJON_BOOT_EEPROM_SERIAL_ADDR, 4
+    );
+  };
 
   /* Call from the application to restart into the bootloader.
      device_id is the id the bootloader will answer to (normally the id of
@@ -125,7 +209,7 @@
     /* The top of SRAM is the bottom of the stack. Nothing is returned to
        from here on, so overwriting it is harmless. */
     PJON_BOOT_MAILBOX[0] = PJON_BOOT_MAGIC_0;
-    PJON_BOOT_MAILBOX[1] = PJON_BOOT_MAGIC_1;
+    PJON_BOOT_MAILBOX[1] = PJON_BOOT_MAGIC_ENTER;
     PJON_BOOT_MAILBOX[2] = device_id;
     wdt_enable(WDTO_15MS);
     for(;;);
