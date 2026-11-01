@@ -228,11 +228,20 @@ class SoftwareBitBang {
     };
 
 
-    /* Input without pull-up, the pull-down resistor keeps the bus low */
+    /* Input without pull-up, the pull-down resistor keeps the bus low.
+       If this device is driving the bus it drives it low for
+       SWBB_DISCHARGE_US first: the pull-down alone (often 100k) would take
+       ~100us to discharge the cable capacitance (~1-2nF for 20m), and the
+       slow falling edge would look like a padding bit. Devices start
+       transmitting at least SWBB_RESPONSE_DELAY after a falling edge, so
+       this short low level can not collide with them. */
 
     SWBB_INLINE static void bus_release() {
-      SWBB_DDR &= ~(1 << SWBB_BIT);
-      SWBB_PORT &= ~(1 << SWBB_BIT);
+      if(SWBB_DDR & (1 << SWBB_BIT)) {
+        SWBB_PORT &= ~(1 << SWBB_BIT);
+        __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_DISCHARGE_US));
+        SWBB_DDR &= ~(1 << SWBB_BIT);
+      } else SWBB_PORT &= ~(1 << SWBB_BIT);
     };
 
 
@@ -861,17 +870,12 @@ class SoftwareBitBang {
     };
 
 
-    /* Release the pin. On AVR the pin is switched to input before the
-       output register is cleared, so it is not driven low after the last
-       high bit, a device may already be responding. */
+    /* Release the pin: driven low first (digitalWrite then pinMode keep
+       it low for a few microseconds), so the cable capacitance is
+       discharged quickly instead of through the pull-down resistor. */
 
     static void release(uint8_t pin) {
-      #ifdef __AVR__
-        PJON_IO_MODE(pin, INPUT);
-        PJON_IO_WRITE(pin, LOW);
-      #else
-        PJON_IO_PULL_DOWN(pin);
-      #endif
+      PJON_IO_PULL_DOWN(pin);
     };
 
     uint16_t _timeout;

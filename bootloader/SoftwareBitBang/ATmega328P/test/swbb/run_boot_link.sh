@@ -21,7 +21,7 @@ BUS_PIN=${BUS_PIN:-2}
 BL_SRC=${BL_SRC:-$HERE/../../pjon_swbb_bootloader.c}
 if [ ! -x "$BUILD/swbb_sim" ] || [ swbb_sim.c -nt "$BUILD/swbb_sim" ]; then
   gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/swbb_sim" swbb_sim.c \
-    -lsimavr -lelf -lpthread || exit 2
+    -lsimavr -lelf -lpthread -lm || exit 2
 fi
 avr-gcc -mmcu=atmega328p -DF_CPU=${FCPU}UL -Os -std=gnu99 \
   -fno-split-wide-types -mrelax -I"$SRC" -DPJON_PIN=$BUS_PIN -DDEVICE_ID=44 \

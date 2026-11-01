@@ -12,7 +12,7 @@ if [ ! -d build/orig_src ]; then
     --strip-components=1 || exit 2
 fi
 [ -x build/swbb_sim ] || gcc -O2 -Wall -I/usr/include/simavr \
-  -o build/swbb_sim swbb_sim.c -lsimavr -lelf -lpthread || exit 2
+  -o build/swbb_sim swbb_sim.c -lsimavr -lelf -lpthread -lm || exit 2
 SHIM=../arduino
 SRC=../../../../../src
 CXX="avr-g++ -mmcu=atmega328p -DF_CPU=16000000UL -Os -std=gnu++11

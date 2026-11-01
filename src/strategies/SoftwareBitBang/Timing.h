@@ -502,6 +502,14 @@
   #define SWBB_RESPONSE_LISTEN      40
 #endif
 
+/* Time a device drives the bus low before releasing it after transmitting
+   (direct port access), to discharge the cable capacitance through the
+   series resistor instead of the pull-down resistor (see bus_release) */
+
+#ifndef SWBB_DISCHARGE_US
+  #define SWBB_DISCHARGE_US 2
+#endif
+
 /* Frame preamble length (by default set to 1 x SWBB_BIT_SPACER)
    Maximum allowed value is 100 or a preamble of 100 x SWBB_BIT_SPACER
    When devices execute other tasks frames may be lost unheard. The preamble

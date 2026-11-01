@@ -16,7 +16,7 @@ CXXFLAGS="-mmcu=atmega328p -DF_CPU=16000000UL -Os -std=gnu++11 -fno-exceptions
   -DARDUINO=10819 -I$SHIM -I$SRC -DBUS_PIN=$BUS_PIN"
 [ -x "$BUILD/swbb_sim" ] && [ "$BUILD/swbb_sim" -nt swbb_sim.c ] || \
   gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/swbb_sim" swbb_sim.c \
-    -lsimavr -lelf -lpthread || exit 2
+    -lsimavr -lelf -lpthread -lm || exit 2
 node() { # node <name> <flags...>
   local name=$1; shift
   avr-g++ "$@" $CXXFLAGS -x c++ swbb_node.ino -x none "$SHIM/arduino_shim.cpp" \
