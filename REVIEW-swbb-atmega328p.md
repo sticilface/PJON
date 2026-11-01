@@ -17,6 +17,12 @@ Naming used in the tables:
 Unless stated otherwise a test sends 200 packets of 20 bytes with **one
 attempt each** (no retries), so the result is the raw link reliability.
 
+> **"Router" in this document.** Two different things are called router:
+> the *Melvan I2C router* (ESP32 → I2C → ATmega328P, PJON id 254, SWBB mode 3
+> on pin 2, see `REVIEW-melvan-router.md`), and PJON's *router mode*
+> (`set_router`, `PJONRouter`, `PJONSimpleSwitch`: a device that acknowledges
+> packets addressed to other ids). Each mention below says which one.
+
 ### Summary
 
 | | Original | This branch, `SWBB_PIN 2` |
@@ -29,7 +35,7 @@ attempt each** (no retries), so the result is the raw link reliability.
 | `can_start()` reports a busy bus as free (mode 3) | 16% | 0% |
 | Bootloader simulation tests | 14/14 | 14/14 |
 
-Use on every node (bootloader, router and plain nodes stay compatible with
+Use on every node (bootloader, Melvan I2C router and plain nodes stay compatible with
 each other in any combination):
 ```cpp
 #define SWBB_MODE 3
@@ -96,7 +102,7 @@ expects `PJDL bit + 0.5us`.
 transmitted stretch one of its bits, interrupts served while a byte is
 received shift the sampling points. With the Timer0 interrupt alone the
 effect is small, with a heavier one (a 15us handler every 256us, like a busy
-I2C slave on the router) the original library fails all the packets.
+I2C slave on the Melvan I2C router) the original library fails all the packets.
 *Fixed with `SWBB_PIN`*: see 3.2.
 
 **1.5 The receiver is late after each byte.** `sync()` measures the padding bit
@@ -229,7 +235,7 @@ receiver loses none.
 
 Bootloader simulation tests (`run_tests.sh`: update through the application
 hook, timeout, fresh chip, interrupted update, pins 2/12/17, modes 1-4, 8MHz
-bootloader, 30kB image, protection, router setup mode 3 pin 2 with packet id
+bootloader, 30kB image, protection, Melvan I2C router sender settings: mode 3 pin 2 with packet id
 and port, missing / out of order chunks): **14/14 with the portable
 implementation and 14/14 with `SWBB_PIN`** (`DIRECT_IO=1 ./run_tests.sh`) for
 the uploader and the application. The bootloader itself is not changed.
@@ -242,7 +248,7 @@ to use `SWBB_PIN` to get 100%.
 
 - Results come from the simulator: it is cycle accurate for the CPU but the
   bus is ideal (no capacitance, no noise, no clock tolerance between devices).
-  A hardware test with the real cable and the router is still needed. The
+  A hardware test with the real cable and the Melvan I2C router is still needed. The
   clock tolerance of ceramic resonators (±0.5%, Nano and Pro Mini clones) moves
   the last data bit by ~1us in mode 3, within the margins measured above.
 - Only 16MHz was tested in the link tests (8MHz compiles, and the bootloader at

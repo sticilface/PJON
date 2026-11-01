@@ -22,6 +22,12 @@ sent by PJON from `bus.receive()`, `IA` interrupt reception with the
 acknowledgement sent from the interrupt. Results are single attempts (no
 retries), 200 packets of 20 bytes (29 bytes on the wire) unless stated.
 
+> **"Router" in this document.** Two different things are called router:
+> the *Melvan I2C router* (ESP32 → I2C → ATmega328P, PJON id 254, SWBB mode 3
+> on pin 2, see `REVIEW-melvan-router.md`), and PJON's *router mode*
+> (`set_router`, `PJONRouter`, `PJONSimpleSwitch`: a device that acknowledges
+> packets addressed to other ids). Each mention below says which one.
+
 ### Summary
 
 - **Wire speed: no.** The bit durations are fixed by PJDL and every device
@@ -46,9 +52,10 @@ retries), 200 packets of 20 bytes (29 bytes on the wire) unless stated.
 Recommendation: worth it for **plain nodes** whose application is busy (it
 replaces a long preamble and frequent polling), with `SWBB_INTERRUPT_ACK`, and
 only if Timer1 is free and no other interrupt handler takes more than ~5us.
-**Not for the router**: its I2C interrupt delays the time stamps, it needs
-shared/router acknowledgement logic, and it does not do long work between
-`bus.receive()` calls anyway. Keep the polling `SWBB_PIN` implementation as
+**Not for the Melvan I2C router**: its I2C interrupt delays the time stamps.
+**Not for devices in PJON router mode** either: the acknowledgement in the
+interrupt can not decide for other ids. A router also does not do long work
+between `bus.receive()` calls, so it gains nothing. Keep the polling `SWBB_PIN` implementation as
 default. It stays fully compatible: the interrupt node transmits with the
 polling code and receives from every other implementation.
 
@@ -86,7 +93,7 @@ polling code and receives from every other implementation.
     CRC8 incrementally (CRC32 with the bootloader's 16 entries table, ~6us per
     byte) and acknowledges as soon as the last byte is received, then PJON's
     `send_response` is skipped for that frame. Local mode only (no bus id
-    check), not for routers, no extended length.
+    check), not for PJON router mode, no extended length.
 
 ### 2. Results
 
@@ -118,8 +125,8 @@ The transmitter waits `SWBB_RESPONSE_OFFSET * length + SWBB_LATENCY` = 20 x 29
 whole frame like with `F`, and the keep busy bits of the transmitter (2 edges
 every ~47us) now trigger interrupts that slow it down. `I` needs
 `SWBB_RESPONSE_OFFSET` >= 25 **on every transmitter** (tested: 50/50 with 25),
-more if the application is busy, which is exactly what the router review
-rejected. Short frames (CRC8, <= 15 bytes) are fast enough: a 9 bytes frame is
+more if the application is busy, which is exactly what the Melvan I2C router review
+(`REVIEW-melvan-router.md`) rejected. Short frames (CRC8, <= 15 bytes) are fast enough: a 9 bytes frame is
 acknowledged by `I` 100/100, a 15 bytes frame 0/100.
 
 **2.3 Busy application (mode 3, 100 packets, transmitter `F`, the receiver
@@ -177,7 +184,7 @@ run before the next edge of the same kind).
   application sees the packet: if the application drops it later (port, packet
   id duplicates) it was acknowledged anyway, as PJON already does.
 - No bus id check in the interrupt (shared mode not acknowledged there), no
-  extended length, no router support.
+  extended length, no PJON router mode.
 - One frame buffer: frames arriving while the previous one was not read are
   ignored. A second buffer would cost `PJON_PACKET_MAX_LENGTH` bytes of RAM.
 - Simulation only (ideal bus, simavr interrupt timing). Not run against the
