@@ -443,8 +443,12 @@ class SoftwareBitBang {
           bus_drive_high();
           __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_WIRE_KEEP_BUSY));
           bus_release();
-          // The pull-down needs a few us to bring the bus down after the keep busy bit
-          // (~6us measured on hardware): without this wait it is read as the response's start and the sync fails
+          /* bus_release drives the bus low before releasing it, so it is
+             already low here. Safety margin: wait up to SWBB_RELEASE_FALL
+             for it to read low (without the discharge it took ~6us on a
+             bench, ~120us expected with 20m of cable and a 100k
+             pull-down), otherwise the keep busy bit is read as the start
+             of the response and the sync fails */
           wait_while_high(SWBB_LOOPS(SWBB_RELEASE_FALL));
           wait_while_low(SWBB_LOOPS(SWBB_RESPONSE_LISTEN));
         }

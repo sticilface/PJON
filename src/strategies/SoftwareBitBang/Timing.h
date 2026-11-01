@@ -498,7 +498,8 @@
    transmitting the next one (direct port access implementation only). It must
    be longer than SWBB_RESPONSE_DELAY plus the receiver's reaction time. */
 
-/* Longest time a released bus takes to fall (pull-down against the bus capacitance) */
+/* Longest time waited for the bus to read low after the keep busy bit is
+   released (safety margin, bus_release already discharges the bus) */
 #ifndef SWBB_RELEASE_FALL
   #define SWBB_RELEASE_FALL         15
 #endif
