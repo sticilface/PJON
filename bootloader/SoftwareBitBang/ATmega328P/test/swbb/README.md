@@ -5,6 +5,7 @@ Two simulated ATmega328P at 16MHz ([simavr](https://github.com/buserror/simavr))
 - `O`: the original library (`src` of git `ORIG_REF`, default `master`)
 - `P`: this library, portable implementation (`digitalRead`, `digitalWrite`, `pinMode`)
 - `F`: this library with `SWBB_PIN` (direct port access)
+- `I` / `IA`: `SWBB_PIN` with `SWBB_INTERRUPT` (interrupt driven reception, see [REVIEW-swbb-interrupt.md](/REVIEW-swbb-interrupt.md)), `IA` with `SWBB_INTERRUPT_ACK`
 
 Requirements: `apt install gcc-avr avr-libc binutils-avr libsimavr-dev libelf-dev`
 
@@ -15,6 +16,10 @@ Requirements: `apt install gcc-avr avr-libc binutils-avr libsimavr-dev libelf-de
 | `./run_boot_link.sh <mode> "<flags>" [bootloader F_CPU]` | A sketch built with `<flags>` sends 200 write chunks to the bootloader (no application), one attempt each: link reliability with the bootloader. `BL_SRC` selects another bootloader source, `BL_FLAGS` adds bootloader flags. |
 | `./sweep.sh <receiver> <mode> [offsets]` | Receive window: a `SWBB_PIN` sender transmits data bits of the mode's bit + offset (us), for receiver `bl`/`bl8` (bootloader at 16/8MHz), `F`, `O` or `P`. |
 | `./grid.sh <tests> "<bit pad acc>"...` | Explores fast mode timing values (mode 5 with overridden values): `ff`, `load`, `bl`, `bl8` and transmitter bit offsets in % (`tx+5`, `bl-3`, `b8+3`). |
+| `./irq_eval.sh [smoke\|matrix\|busy\|load]` | Interrupt driven receiver against the polling ones: reception from every implementation, receiver busy between `bus.receive()` calls (`BUSY` us), interrupt load on the receiver (`ISR` us). |
+| `./size_irq.sh` | Flash, RAM and idle polling cost of `F`, `I`, `IA`. |
+| `python3 ack_latency.py <trace>` | Acknowledgement latency from a `SIM_FLAGS=-e` trace. |
+| `python3 isr_time.py <trace>` | Interrupt time of B from a trace, B built with `-DSWBB_IRQ_PIN_DEBUG` (PD3 high in the interrupts). |
 | `./bench.sh [modes]` | CPU time taken polling an idle bus, duration of `can_start()`, and how often `can_start()` wrongly reports the bus free while another device is waiting for a response (keep busy bits). |
 
-The simulator (`swbb_sim.c`) reports bus contention: one device driving the bus high while the other drives it low.
+The simulator (`swbb_sim.c`) drives the bus pin through the simavr port IRQ, so pin change and external interrupts work, traces PD3 of B (`-e`) and reports bus contention: one device driving the bus high while the other drives it low.
