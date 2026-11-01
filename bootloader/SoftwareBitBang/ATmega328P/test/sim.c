@@ -27,6 +27,7 @@
 #include <simavr/sim_avr.h>
 #include <simavr/sim_hex.h>
 #include <simavr/parts/uart_pty.h>
+#include <simavr/avr_ioport.h>
 
 #define MCU "atmega328p"
 #define UPLOADER_FREQUENCY 16000000
@@ -63,7 +64,13 @@ static int drives_low(avr_t *avr) {
   return (avr->data[ddr_reg] & mask) && !(avr->data[port_reg] & mask);
 }
 
+static avr_irq_t *pin_irq_target, *pin_irq_uploader;
+
+/* Sets the bus level seen by a core: through the port pin IRQ, so that pin
+   change and external interrupts (INT0/INT1) are triggered */
 static void set_input(avr_t *avr, int level) {
+  avr_irq_t *irq = (avr == target) ? pin_irq_target : pin_irq_uploader;
+  if(irq->value != (uint32_t)level) avr_raise_irq(irq, level);
   if(level) avr->data[pin_reg] |= mask;
   else avr->data[pin_reg] &= ~mask;
 }
@@ -111,6 +118,14 @@ int main(int argc, char **argv) {
   if(!target || !uploader) return 2;
   avr_init(target);
   avr_init(uploader);
+  {
+    char port = (bus_pin <= 7) ? 'D' : ((bus_pin <= 13) ? 'B' : 'C');
+    int bit = (bus_pin <= 7) ? bus_pin :
+      ((bus_pin <= 13) ? bus_pin - 8 : bus_pin - 14);
+    pin_irq_target = avr_io_getirq(target, AVR_IOCTL_IOPORT_GETIRQ(port), bit);
+    pin_irq_uploader =
+      avr_io_getirq(uploader, AVR_IOCTL_IOPORT_GETIRQ(port), bit);
+  }
   target->frequency = target_frequency;
   uploader->frequency = UPLOADER_FREQUENCY;
   target->log = uploader->log = LOG_WARNING;

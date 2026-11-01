@@ -9,6 +9,7 @@
      -r address  node B starts at this address (a bootloader), it is not
                  expected to print DONE
      -F hz       node B clock frequency (default 16000000)
+     -T          append the simulated time to the lines printed by the nodes
    The USART0 output of each node is printed prefixed by "A: " or "B: ".
    The simulation ends when both nodes printed a line starting with "DONE"
    or when the maximum time is reached. Exit code 0 if both printed DONE. */
@@ -40,7 +41,7 @@ static void set_level(int n, int level) {
   else a->data[pin_reg] &= ~mask;
 }
 static char line[2][256];
-static int line_len[2], done[2];
+static int line_len[2], done[2], stamp = 0;
 
 static void load(avr_t *avr, const char *path) {
   uint32_t size = 0, start = 0;
@@ -61,7 +62,9 @@ static void uart_out(struct avr_irq_t *irq, uint32_t value, void *param) {
   if(c == '\r') return;
   if(c == '\n' || line_len[n] == 255) {
     line[n][line_len[n]] = 0;
-    printf("%c: %s\n", 'A' + n, line[n]);
+    if(stamp) printf("%c: %s [sim %.3f ms]\n", 'A' + n, line[n],
+      node[n]->cycle / (node[n]->frequency / 1000.0));
+    else printf("%c: %s\n", 'A' + n, line[n]);
     if(!strncmp(line[n], "DONE", 4)) done[n] = 1;
     line_len[n] = 0;
     return;
@@ -85,13 +88,14 @@ int main(int argc, char **argv) {
   int bus_pin = 2, trace = 0, histo = 0, opt;
   long b_reset = -1, b_frequency = 16000000;
   double max_seconds = 10;
-  while((opt = getopt(argc, argv, "a:b:B:t:ehr:F:")) != -1) {
+  while((opt = getopt(argc, argv, "a:b:B:t:ehr:F:T")) != -1) {
     switch(opt) {
       case 'a': hex[0] = optarg; break;
       case 'b': hex[1] = optarg; break;
       case 'B': bus_pin = atoi(optarg); break;
       case 't': max_seconds = atof(optarg); break;
       case 'e': trace = 1; break;
+      case 'T': stamp = 1; break;
       case 'h': histo = 1; break;
       case 'r': b_reset = strtol(optarg, NULL, 0); break;
       case 'F': b_frequency = atol(optarg); break;
