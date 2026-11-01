@@ -98,6 +98,14 @@
   #define SWBB_BIT_NOPS(BIT, OVERHEAD) ((SWBB_CYCLES(BIT) - (OVERHEAD)) % 4)
 #endif
 
+/* Interrupt driven reception (prototype, see SoftwareBitBangIRQ.h) */
+#ifdef SWBB_INTERRUPT
+  #ifndef SWBB_PIN
+    #error "SWBB_INTERRUPT requires SWBB_PIN"
+  #endif
+  #define SoftwareBitBang SoftwareBitBangPolling
+#endif
+
 class SoftwareBitBang {
   public:
     /* Returns the delay related to the attempts passed as parameter: */
@@ -849,4 +857,9 @@ class SoftwareBitBang {
     uint8_t  _input_pin;
     uint8_t  _output_pin;
 };
+#endif
+
+#ifdef SWBB_INTERRUPT
+  #undef SoftwareBitBang
+  #include "SoftwareBitBangIRQ.h"
 #endif

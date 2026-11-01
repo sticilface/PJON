@@ -19,11 +19,23 @@
 #include <simavr/sim_hex.h>
 #include <simavr/sim_irq.h>
 #include <simavr/avr_uart.h>
+#include <simavr/avr_ioport.h>
 
 #define MCU "atmega328p"
 
 static avr_t *node[2];
-static int pin_reg, ddr_reg, port_reg, mask;
+static int pin_reg, ddr_reg, port_reg, mask, bus_bit;
+static char bus_port;
+static avr_irq_t *pin_irq[2];
+
+/* Sets the bus level seen by a node: through the port pin IRQ, so that pin
+   change and external interrupts (INT0/INT1) are triggered */
+static void set_level(int n, int level) {
+  avr_t *a = node[n];
+  if(pin_irq[n]->value != (uint32_t)level) avr_raise_irq(pin_irq[n], level);
+  if(level) a->data[pin_reg] |= mask;
+  else a->data[pin_reg] &= ~mask;
+}
 static char line[2][256];
 static int line_len[2], done[2];
 
@@ -82,9 +94,10 @@ int main(int argc, char **argv) {
   }
   if(!hex[0] || !hex[1]) return 2;
   setvbuf(stdout, NULL, _IONBF, 0);
-  if(bus_pin <= 7) { pin_reg = 0x29; mask = 1 << bus_pin; }
-  else if(bus_pin <= 13) { pin_reg = 0x23; mask = 1 << (bus_pin - 8); }
-  else { pin_reg = 0x26; mask = 1 << (bus_pin - 14); }
+  if(bus_pin <= 7) { pin_reg = 0x29; bus_bit = bus_pin; bus_port = 'D'; }
+  else if(bus_pin <= 13) { pin_reg = 0x23; bus_bit = bus_pin - 8; bus_port = 'B'; }
+  else { pin_reg = 0x26; bus_bit = bus_pin - 14; bus_port = 'C'; }
+  mask = 1 << bus_bit;
   ddr_reg = pin_reg + 1;
   port_reg = pin_reg + 2;
 
@@ -94,6 +107,7 @@ int main(int argc, char **argv) {
     node[n]->frequency = 16000000;
     node[n]->log = LOG_WARNING;
     load(node[n], hex[n]);
+    pin_irq[n] = avr_io_getirq(node[n], AVR_IOCTL_IOPORT_GETIRQ(bus_port), bus_bit);
     avr_irq_t *irq = avr_io_getirq(node[n], AVR_IOCTL_UART_GETIRQ('0'),
       UART_IRQ_OUTPUT);
     avr_irq_register_notify(irq, uart_out, (void *)(intptr_t)n);
@@ -122,10 +136,8 @@ int main(int argc, char **argv) {
       }
       contention_now = 1;
     } else contention_now = 0;
-    node[0]->data[pin_reg] = level ? (node[0]->data[pin_reg] | mask) :
-      (node[0]->data[pin_reg] & ~mask);
-    node[1]->data[pin_reg] = level ? (node[1]->data[pin_reg] | mask) :
-      (node[1]->data[pin_reg] & ~mask);
+    set_level(0, level);
+    set_level(1, level);
     if(level != last_level) {
       double now = us(avr);
       if(trace) printf("%.2f %d %c%c\n", now, level, ha ? 'A' : '-', hb ? 'B' : '-');

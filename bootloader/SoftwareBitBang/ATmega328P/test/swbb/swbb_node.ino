@@ -24,6 +24,7 @@
 
 PJONSoftwareBitBang bus(MY_ID);
 static uint16_t received = 0, bad = 0;
+static uint8_t seen[32];
 
 static void print_number(uint32_t n) {
   char b[11];
@@ -38,6 +39,7 @@ static void receiver(uint8_t *payload, uint16_t length,
   (void)info;
   received++;
   if(length != LENGTH) { bad++; return; }
+  seen[(payload[0] >> 3) & 31] |= 1 << (payload[0] & 7);
   for(uint16_t i = 1; i < length; i++)
     if(payload[i] != (uint8_t)(payload[0] + i * 7)) { bad++; return; }
 }
@@ -89,12 +91,32 @@ void loop() {
   }
   bus.receive(200);
 #else
-  bus.receive(1000);
+  #ifdef BUSY_US
+    /* The application is busy for BUSY_US between two bus.receive() calls */
+    bus.receive();
+    for(uint32_t w = BUSY_US; w; ) {
+      uint16_t d = (w > 10000) ? 10000 : w;
+      delayMicroseconds(d);
+      w -= d;
+    }
+  #else
+    bus.receive(1000);
+  #endif
   static bool printed = false;
   if(!printed && ((received >= COUNT) || (millis() > RX_TIMEOUT))) {
     printed = true;
     Serial.print("DONE received "); print_number(received);
     Serial.print(" bad "); print_number(bad);
+    #ifdef SWBB_INTERRUPT
+      Serial.print(" frames "); print_number(swbb_irq::frames);
+      Serial.print(" ignored "); print_number(swbb_irq::ignored);
+      Serial.print(" missing:");
+      uint8_t shown = 0;
+      for(uint16_t i = 0; i < COUNT && i < 256 && shown < 8; i++)
+        if(!(seen[i >> 3] & (1 << (i & 7)))) {
+          Serial.print(" "); print_number(i); shown++;
+        }
+    #endif
     Serial.println("");
   }
 #endif
