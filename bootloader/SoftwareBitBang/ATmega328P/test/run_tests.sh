@@ -13,6 +13,9 @@
 #   pip install pyserial
 #
 # Usage: ./run_tests.sh [test name ...]   (default: all tests)
+# Environment:
+#   DIRECT_IO=1     build the sketches with SWBB_PIN (direct port access)
+#   SKETCH_FLAGS    extra compiler flags for the sketches
 
 set -u
 cd "$(dirname "$0")"
@@ -49,7 +52,8 @@ build() {
     || exit 1
   cp "$BL_DIR/pjon_swbb_bootloader.hex" "$BUILD/$name-bootloader.hex"
   make -s -C "$BL_DIR" clean
-  local flags="-DBUS_PIN=$pin -DSWBB_MODE=$mode $extra"
+  local flags="-DBUS_PIN=$pin -DSWBB_MODE=$mode $extra ${SKETCH_FLAGS:-}"
+  [ "${DIRECT_IO:-0}" = 1 ] && flags="$flags -DSWBB_PIN=$pin"
   sketch "$EXAMPLES/AppWithBootloaderHook/AppWithBootloaderHook.ino" \
     "$name-app_v1" $flags -DAPP_MARKER=1
   sketch "$EXAMPLES/AppWithBootloaderHook/AppWithBootloaderHook.ino" \

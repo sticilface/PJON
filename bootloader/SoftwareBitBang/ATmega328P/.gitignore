@@ -3,3 +3,4 @@
 *.lst
 test/build/
 __pycache__/
+test/swbb/build/

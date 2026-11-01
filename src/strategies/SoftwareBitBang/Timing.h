@@ -339,6 +339,100 @@
 #endif
 
 
+/* PJDL v5.0 timing as it must appear on the wire, in microseconds. Used by
+   the direct port access implementation (SWBB_PIN defined), which executes
+   in a known number of cycles and so does not need the per-MCU adjustments
+   above. The bootloader uses the same padding and data bit values. The keep
+   busy bit is shorter than specified in modes 1 and 2 (still within its -5us
+   tolerance): receivers of previous versions wait for its falling edge for
+   only SWBB_BIT_WIDTH / 4 and would otherwise start the response while it
+   is still being transmitted. */
+
+#if SWBB_MODE == 1
+  #define SWBB_WIRE_PAD_DEFAULT        110
+  #define SWBB_WIRE_BIT_DEFAULT         44
+  #define SWBB_WIRE_KEEP_BUSY_DEFAULT    9
+#elif SWBB_MODE == 2
+  #define SWBB_WIRE_PAD_DEFAULT         92
+  #define SWBB_WIRE_BIT_DEFAULT         40
+  #define SWBB_WIRE_KEEP_BUSY_DEFAULT    8
+#elif SWBB_MODE == 3
+  #define SWBB_WIRE_PAD_DEFAULT         70
+  #define SWBB_WIRE_BIT_DEFAULT         28
+  #define SWBB_WIRE_KEEP_BUSY_DEFAULT    7
+#elif SWBB_MODE == 4
+  #define SWBB_WIRE_PAD_DEFAULT         65
+  #define SWBB_WIRE_BIT_DEFAULT         26
+  #define SWBB_WIRE_KEEP_BUSY_DEFAULT  6.5
+#endif
+
+#ifndef SWBB_WIRE_PAD
+  #define SWBB_WIRE_PAD SWBB_WIRE_PAD_DEFAULT
+#endif
+#ifndef SWBB_WIRE_BIT
+  #define SWBB_WIRE_BIT SWBB_WIRE_BIT_DEFAULT
+#endif
+#ifndef SWBB_WIRE_KEEP_BUSY
+  #define SWBB_WIRE_KEEP_BUSY SWBB_WIRE_KEEP_BUSY_DEFAULT
+#endif
+
+/* Data bit duration transmitted and expected when receiving by the direct
+   port access implementation. Receivers using digitalRead (the portable
+   implementation) sample with a period slightly longer than
+   SWBB_WIRE_BIT (in mode 3 they accept about 28.2-29.8us), receivers with
+   exact timing (the bootloader) accept about 27-29.5us: transmitting
+   SWBB_WIRE_BIT + 1 is within both. When receiving, the data bit is expected
+   to last SWBB_WIRE_BIT + 0.5, in the middle between what the portable
+   implementation (~SWBB_WIRE_BIT + 0.2), the bootloader (SWBB_WIRE_BIT) and
+   this implementation (SWBB_WIRE_BIT + 1) transmit. */
+
+#ifndef SWBB_TX_BIT
+  #define SWBB_TX_BIT (SWBB_WIRE_BIT + 1)
+#endif
+#ifndef SWBB_RX_BIT
+  #define SWBB_RX_BIT (SWBB_WIRE_BIT + 0.5)
+#endif
+
+/* Longest padding bit accepted by the direct port access implementation
+   (PJDL tolerance is +17us in mode 1, the portable implementation transmits
+   it a few microseconds longer if interrupted) */
+
+#ifndef SWBB_WIRE_PAD_MAX
+  #define SWBB_WIRE_PAD_MAX (SWBB_WIRE_PAD + 20)
+#endif
+
+/* Response: after the falling edge of the transmitter's keep busy bit wait
+   SWBB_RESPONSE_DELAY microseconds before transmitting the response. A
+   transmitter using digitalWrite and pinMode keeps driving the pin low for a
+   few microseconds after the falling edge before releasing it, transmitting
+   earlier would cause bus contention. SWBB_RESPONSE_PULSE_WAIT is the maximum
+   time waited for a keep busy bit (the keep busy bit period is ~52us using
+   digitalWrite on a 16MHz ATmega328P, ~48us with direct port access). */
+
+#ifndef SWBB_RESPONSE_DELAY
+  #define SWBB_RESPONSE_DELAY       18
+#endif
+
+/* Same delay for the portable implementation: detecting the falling edge
+   with micros and digitalRead and switching the pin with digitalWrite and
+   pinMode already take 9-18us on a 16MHz ATmega328P, so none is added */
+
+#ifndef SWBB_RESPONSE_DELAY_PORTABLE
+  #define SWBB_RESPONSE_DELAY_PORTABLE 0
+#endif
+
+#ifndef SWBB_RESPONSE_PULSE_WAIT
+  #define SWBB_RESPONSE_PULSE_WAIT 100
+#endif
+
+/* Time the transmitter waits for a response after each keep busy bit before
+   transmitting the next one (direct port access implementation only). It must
+   be longer than SWBB_RESPONSE_DELAY plus the receiver's reaction time. */
+
+#ifndef SWBB_RESPONSE_LISTEN
+  #define SWBB_RESPONSE_LISTEN      40
+#endif
+
 /* Frame preamble length (by default set to 1 x SWBB_BIT_SPACER)
    Maximum allowed value is 100 or a preamble of 100 x SWBB_BIT_SPACER
    When devices execute other tasks frames may be lost unheard. The preamble

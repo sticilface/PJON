@@ -70,6 +70,8 @@ Before including the library it is possible to configure `SoftwareBitBang` using
 | `SWBB_MAX_ATTEMPTS`     | Maximum transmission attempts        | Numeric value (20 by default)              |
 | `SWBB_PREAMBLE`         | Preamble Length                      | Numeric value (1 by default), max 100      |
 | `SWBB_MAX_PREAMBLE`     | Maximum preamble length              | Numeric value (1 by default), max 100      |
+| `SWBB_PIN`              | Direct port access on this pin (ATmega88/168/328 only, see below) | Arduino pin number 0-19 |
+| `SWBB_ATOMIC`           | With `SWBB_PIN`, disable interrupts while a byte is transmitted or received | 1 (default) or 0 |
 
 `SoftwareBitBang` supports the use of input and output pins because separated signals may be required if additional circuitry is used for amplification or noise filtering. It also works if pins are directly connected as a simple point-to-point null-modem or cross-over serial link.
 
@@ -87,6 +89,19 @@ void setup() {
 ```
 After the PJON object is defined with its strategy, it is possible to set the communication pin by accessing the strategy present in the PJON instance. All the other necessary information is present in the general [Documentation](/documentation).
 
+### Direct port access (ATmega88/168/328)
+On the ATmega88/168/328 (Arduino Uno, Nano, Pro Mini) the pin can be selected at compile time defining `SWBB_PIN` before including the library. The pin is then read and written with single instructions instead of `digitalRead`, `digitalWrite` and `pinMode`, as the [bootloader](/bootloader/SoftwareBitBang/ATmega328P) does, and the timing is cycle exact:
+```cpp
+#define SWBB_MODE 3
+#define SWBB_PIN  2 // set_pin and set_pins are then ignored
+#include <PJONSoftwareBitBang.h>
+```
+- It is compatible with devices using the default implementation (also previous versions) and with the bootloader, in all modes.
+- Less flash: ~630 bytes less in a sketch using PJON only, ~290 bytes less if the sketch uses `digitalRead`/`digitalWrite` elsewhere. Polling is ~2.8 times faster: `bus.receive()` with an idle bus takes ~14us instead of ~40us (16MHz).
+- The padding bit is measured from its rising edge to its falling edge (with a resolution of 0.375us) and the data bits are sampled at a fixed number of cycles from the falling edge, so the receiver is not affected by the time spent in `bus.receive()` or by interrupts served between bytes.
+- Interrupts are disabled while a byte is transmitted or received (~0.3ms in mode 3, ~0.5ms in mode 1) and served during the padding bits, the time spent in interrupts is measured with Timer0 and compensated, so an interrupt can not distort a byte. Define `SWBB_ATOMIC 0` to keep interrupts enabled.
+- Timer0 must run as configured by the Arduino core (`millis`), it is read and never modified.
+
 ### Why not interrupts?
 In the Arduino environment the use of libraries is really extensive and often the end user is not able to go over collisions. Very often a library is using hardware resources of the microcontroller, colliding with other libraries. This happens because in general Arduino boards have limited hardware resources. Software-defined bit-banging, is a stable and reliable solution that leads to "more predictable" results than interrupt driven procedures coexisting on limited microcontrollers without the developer and the end user knowing about it.
 
@@ -98,7 +113,7 @@ PJON application example made by the user [Michael Teeuw](http://michaelteeuw.nl
 - A 1-5 MΩ pull down resistor could be necessary to reduce interference, see [Mitigate interference](https://github.com/gioblu/PJON/wiki/Mitigate-interference).
 - When using more than one instance of `SoftwareBitBang` in the same sketch use pins part of different port groups to avoid cross-talk.  
 - During the execution of other tasks or delays a certain amount of packets could be potentially lost because transmitted out of the polling time of the receiver device. Thanks to the PJON packet handler after some retries the packet is received but a certain amount of bandwidth is wasted. If this situation occurs try to reduce the duration of other tasks and use a frame preamble setting `SWBB_MAX_PREAMBLE` and `SWBB_PREAMBLE` to a value between 1 and 100. The optimal preamble length is the maximum interval between each `bus.receive()` call divided by `SWBB_BIT_SPACER`
-- `SoftwareBitBang` strategy can have compatibility issues with codebases that are using interrupts, reliability or bandwidth loss can occur because of the interruptions made by third party software.
+- `SoftwareBitBang` strategy can have compatibility issues with codebases that are using interrupts, reliability or bandwidth loss can occur because of the interruptions made by third party software. On the ATmega88/168/328 use [direct port access](#direct-port-access-atmega88168328) to avoid it.
 - If you need to connect devices that operate at different voltages, for example when connecting an Arduino UNOs to an ESP32, consider that voltage level converters available in the market are often not compatible with PJDL, you can try this [alternative approach](http://www.falstad.com/circuit/circuitjs.html?ctz=CQAgjCAMB0l3BWEA2AzNA7ATi8gHACxhaKTJYgaohIHUICmAtGGAFABu4WATCKgj7E+PDH0hQQBCemoT50BJxpg+AvglUhR4ydJqSFSgO5SCefoO0Jkl8WwAm12z0gWeN8D3fgAcqgI2AAduETcvd3CIeTZTD1t1ULsoWJU1KwJzZMhU4XAtePz7UwJkAiK0ipySsorMi1Z7EM0wiwQMFyjDNgBnSp1+8PkQADMAQwAbHoY2ACdnbXDCxIlCeF6kgbzXCwkIcamZ+bzGzaGpVzhUwp2z3evPU-qqh9tTwtV7+eenrJXweDreYtCog24SS5sAAeICYPBcYDerm0xCk2nKqA4qAAOj0HAwOABLADGDFxAEkAPLQmiEFHlDBgDAo5nlHjlBAcXH4omkinUmHECCoOkISAUEWs8BIADKAHVyQAVADCAAkAKIy3EAQQASurcQBVGXqgAiuMVlNxMvJAFlDQAZbWKg09SmGxUABQ9bCAA) proposed by [alastaira](https://github.com/alastaira) instead. It isn't truly converting voltage levels but it is much quicker and cheaper than designs based on transistors.  
 
 ### Safety warning
