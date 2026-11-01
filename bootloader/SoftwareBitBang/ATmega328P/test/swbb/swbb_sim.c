@@ -5,6 +5,12 @@
      -B pin      bus pin, Arduino numbering (default 2)
      -t seconds  maximum simulated time (default 10)
      -e          print every bus level change (microseconds, who drives)
+     -C pF       analog bus model: total bus capacitance (cable + pins), the
+                 bus is then a single RC node instead of an ideal wire
+     -R ohm      series resistor of each device (default 100, with -C)
+     -P ohm      pull-down resistor of the bus (default 100000, with -C)
+                 The level seen by each device has the ATmega328P input
+                 hysteresis (rising 2.7V, falling 2.2V at 5V).
      -h          print a histogram of high/low durations per driver
      -r address  node B starts at this address (a bootloader), it is not
                  expected to print DONE
@@ -15,6 +21,7 @@
    or when the maximum time is reached. Exit code 0 if both printed DONE. */
 
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -88,7 +95,8 @@ int main(int argc, char **argv) {
   int bus_pin = 2, trace = 0, histo = 0, opt;
   long b_reset = -1, b_frequency = 16000000;
   double max_seconds = 10;
-  while((opt = getopt(argc, argv, "a:b:B:t:ehr:F:T")) != -1) {
+  double cap_pf = 0, r_series = 100, r_pull = 100000;
+  while((opt = getopt(argc, argv, "a:b:B:t:ehr:F:TC:R:P:")) != -1) {
     switch(opt) {
       case 'a': hex[0] = optarg; break;
       case 'b': hex[1] = optarg; break;
@@ -99,6 +107,9 @@ int main(int argc, char **argv) {
       case 'h': histo = 1; break;
       case 'r': b_reset = strtol(optarg, NULL, 0); break;
       case 'F': b_frequency = atol(optarg); break;
+      case 'C': cap_pf = atof(optarg); break;
+      case 'R': r_series = atof(optarg); break;
+      case 'P': r_pull = atof(optarg); break;
       default: return 2;
     }
   }
@@ -146,6 +157,28 @@ int main(int argc, char **argv) {
     }
     int ha = drives_high(node[0]), hb = drives_high(node[1]);
     int level = ha || hb;
+    if(cap_pf > 0) {
+      /* Analog bus: drivers (25 ohm output + series resistor) and the
+         pull-down charge the bus capacitance, integrated exactly over the
+         time elapsed since the last step */
+      static double v = 0, t_last = 0;
+      static int seen[2] = {0, 0};
+      double now = us(avr), dt = (now - t_last) * 1e-6;
+      t_last = now;
+      double g = 1.0 / r_pull, i = 0, gd = 1.0 / (r_series + 25);
+      for(int n = 0; n < 2; n++) {
+        if(drives_high(node[n])) { g += gd; i += gd * 5.0; }
+        else if(drives_low(node[n])) g += gd;
+      }
+      double v_end = i / g, tau = cap_pf * 1e-12 / g;
+      if(dt > 0) v = v_end + (v - v_end) * exp(-dt / tau);
+      for(int n = 0; n < 2; n++) {
+        if(!seen[n] && v > 2.7) seen[n] = 1;
+        else if(seen[n] && v < 2.2) seen[n] = 0;
+      }
+      set_level(1, seen[1]);
+      level = seen[0];
+    }
     if((ha && drives_low(node[1])) || (hb && drives_low(node[0]))) {
       if(!contention_now) {
         contention++;
@@ -154,7 +187,7 @@ int main(int argc, char **argv) {
       contention_now = 1;
     } else contention_now = 0;
     set_level(0, level);
-    set_level(1, level);
+    if(cap_pf <= 0) set_level(1, level);
     if(level != last_level) {
       double now = us(avr);
       if(trace) printf("%.2f %d %c%c\n", now, level, ha ? 'A' : '-', hb ? 'B' : '-');
