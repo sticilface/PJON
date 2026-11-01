@@ -12,7 +12,10 @@ Sequence:
  2. ping the bootloader until it answers ('P')
  3. erase page 0 first, so an interrupted upload leaves a device that stays
     in the bootloader instead of running a half written application
- 4. write every other page, then page 0 last ('W', verified by the target)
+ 4. write every other page, then page 0 last. A page is sent as chunks
+    ('W', --chunk-size bytes each, must match the bootloader build) followed
+    by a ping, acknowledged only once the page is written and verified; if
+    it is not, the page is sent again
  5. start the new application ('G')
 
 Requires pyserial (pip install pyserial).
@@ -65,7 +68,7 @@ def parse_hex(path):
     return data
 
 
-def build_pages(data, boot_start):
+def build_pages(data, boot_start=0x7800):
     if not data:
         raise ValueError("the HEX file is empty")
     end = max(data) + 1
@@ -78,6 +81,17 @@ def build_pages(data, boot_start):
         page = bytes(data.get(address + i, 0xFF) for i in range(PAGE_SIZE))
         pages.append((address, page))
     return pages
+
+
+def write_page(up, device_id, address, page, chunk_size):
+    """Sends the chunks of a page, then a ping that is acknowledged only if
+    the page was written and verified. Returns True if it was."""
+    for offset in range(0, PAGE_SIZE, chunk_size):
+        chunk_address = address + offset
+        command = CMD_WRITE + bytes([chunk_address >> 8, chunk_address & 0xFF])
+        if not up.send(device_id, command + page[offset:offset + chunk_size]):
+            return False
+    return up.send(device_id, CMD_PING)
 
 
 class Uploader:
@@ -111,8 +125,13 @@ def main():
     parser.add_argument("--port", required=True, help="serial port of the Uploader")
     parser.add_argument("--id", type=int, required=True, help="target device id")
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--boot-start", type=lambda v: int(v, 0), default=0x7C00,
-                        help="bootloader start address (default 0x7C00)")
+    parser.add_argument("--boot-start", type=lambda v: int(v, 0), default=0x7800,
+                        help="bootloader start address (default 0x7800, 2kB "
+                             "bootloader; 0x7000 for a 4kB boot section)")
+    parser.add_argument("--chunk-size", type=int, default=32,
+                        choices=[16, 32, 64, 128],
+                        help="bytes per write packet, as CHUNK_SIZE of the "
+                             "bootloader build (default 32)")
     parser.add_argument("--no-enter", action="store_true",
                         help="do not ask the application to enter the bootloader")
     parser.add_argument("--ping-attempts", type=int, default=5)
@@ -145,9 +164,10 @@ def main():
 
     def write(address, page):
         for _ in range(args.write_attempts):
-            if up.send(args.id, CMD_WRITE + bytes([address >> 8, address & 0xFF]) + page):
+            if write_page(up, args.id, address, page, args.chunk_size):
                 return
-        sys.exit("\nwriting page 0x%04X failed" % address)
+        sys.exit("\nwriting page 0x%04X failed (is --chunk-size the same as "
+                 "the bootloader's CHUNK_SIZE?)" % address)
 
     write(0, b"\xFF" * PAGE_SIZE)  # invalidate the application first
     order = pages[1:] + pages[:1]  # page 0 (reset vector) last

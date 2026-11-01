@@ -40,15 +40,16 @@ sketch() {
   avr-objcopy -O ihex -R .eeprom "$BUILD/$out.elf" "$BUILD/$out.hex"
 }
 
-# build <name> <bus pin> <mode> <F_CPU>: bootloader, app v1, app v2, uploader
+# build <name> <bus pin> <mode> <F_CPU> [sketch flags]: bootloader, app v1,
+# app v2 and uploader. Sketch flags are added to the three PJON sketches.
 build() {
-  local name=$1 pin=$2 mode=$3 fcpu=$4
+  local name=$1 pin=$2 mode=$3 fcpu=$4 extra=${5:-}
   make -s -C "$BL_DIR" clean
   make -s -C "$BL_DIR" PJON_PIN=$pin MODE=$mode F_CPU=$fcpu DEVICE_ID=$ID \
     || exit 1
   cp "$BL_DIR/pjon_swbb_bootloader.hex" "$BUILD/$name-bootloader.hex"
   make -s -C "$BL_DIR" clean
-  local flags="-DBUS_PIN=$pin -DSWBB_MODE=$mode"
+  local flags="-DBUS_PIN=$pin -DSWBB_MODE=$mode $extra"
   sketch "$EXAMPLES/AppWithBootloaderHook/AppWithBootloaderHook.ino" \
     "$name-app_v1" $flags -DAPP_MARKER=1
   sketch "$EXAMPLES/AppWithBootloaderHook/AppWithBootloaderHook.ino" \
@@ -140,7 +141,8 @@ test_fresh_chip() {
 }
 
 test_interrupted() {
-  echo "interrupted: upload stopped after 10 pages, bootloader stays, retry works"
+  echo "interrupted: upload stopped in the middle of a page, bootloader stays,"
+  echo "  retry works"
   build m1 12 1 16000000
   start_sim m1 12 -a "$BUILD/m1-app_v1.hex" -m 2 -w 1 -t 120
   python3 client.py partial "$PTY" $ID "$BUILD/m1-app_v2.hex" 10 \
@@ -189,7 +191,7 @@ test_8mhz() {
 }
 
 test_large_image() {
-  echo "large_image: application area filled up to the bootloader (31kB)"
+  echo "large_image: application area filled up to the bootloader (30kB)"
   build m1 12 1 16000000
   python3 client.py large "$BUILD/m1-app_v2.hex" "$BUILD/m1-large.hex" \
     | sed 's/^/    /'
@@ -209,11 +211,31 @@ test_protection() {
   result $?
 }
 
+test_router() {
+  echo "router: mode 3, pin 2, sender with PJON_PACKET_MAX_LENGTH 50, packet id,"
+  echo "  port, sender info and default SWBB_RESPONSE_OFFSET (Melvan router setup)"
+  build r3 2 3 16000000 "-DPJON_INCLUDE_PACKET_ID -DPJON_PACKET_MAX_LENGTH=50"
+  upload_test r3 2
+  result $?
+}
+
+test_chunks() {
+  echo "chunks: missing, out of order and repeated chunks"
+  build m1 12 1 16000000
+  start_sim m1 12 -t 300
+  python3 client.py chunks "$PTY" $ID | sed 's/^/    /'
+  local client=${PIPESTATUS[0]}
+  kill "$SIM_PID" 2> /dev/null
+  wait "$SIM_PID" 2> /dev/null
+  [ $client -eq 0 ]
+  result $?
+}
+
 gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/sim" sim.c \
   -lsimavrparts -lsimavr -lelf -lpthread -lutil || exit 1
 
 TESTS=${*:-hook_upload timeout fresh_chip interrupted pins modes 8mhz \
-  large_image protection}
+  large_image protection router chunks}
 for t in $TESTS; do "test_$t"; done
 echo "passed: $PASSED, failed: $FAILED"
 [ $FAILED -eq 0 ]

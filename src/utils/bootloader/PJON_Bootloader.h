@@ -8,15 +8,36 @@
 
    It is plain C so the bootloader can include it without the PJON library.
 
-   Over-the-air protocol (PJON local mode, CRC32, port PJON_BOOT_PORT):
+   Over-the-air protocol (PJON local mode, port PJON_BOOT_PORT). Every packet
+   sent to the bootloader must use CRC32: PJON uses it automatically only
+   above 15 bytes, so senders must force it (bus.set_crc_32(true)) at least
+   for the short commands.
 
    Application (normal PJON sketch, PJON_INCLUDE_PORT must be defined):
-     'B'                       -> application restarts into the bootloader
+     'B'                         -> application restarts into the bootloader
 
-   Bootloader (acknowledges only after the command succeeded):
-     'P'                       -> ping, used to detect the bootloader
-     'W' addrH addrL data[128] -> erase, write and verify one flash page
-     'G'                       -> leave the bootloader and start the app
+   Bootloader:
+     'P'                         -> ping: acknowledged only if the last page
+                                    was written and verified (or no page was
+                                    written yet)
+     'W' addrH addrL data[CHUNK] -> one chunk of a flash page. addr is the
+                                    byte address of the chunk, aligned to
+                                    PJON_BOOT_CHUNK_SIZE. Chunks of a page
+                                    must be sent in order; a chunk can be
+                                    repeated (lost acknowledgement). When the
+                                    last chunk of a page is received it is
+                                    acknowledged, then the page is erased,
+                                    written and verified (~9ms, the bootloader
+                                    does not listen meanwhile). A missing or
+                                    out of order chunk makes the page fail.
+     'G'                         -> start the application: acknowledged only
+                                    if the last page is correct
+
+   Writing a page: send its chunks, then a ping. The ping is not answered
+   while the page is being written (PJON retries), and is answered only if
+   the page is in flash and verified, otherwise the page must be resent.
+   This keeps every acknowledgement fast, so senders can use the default
+   SWBB_RESPONSE_OFFSET and PJON_PACKET_MAX_LENGTH (chunk size 32).
 
    How the application enters the bootloader:
    The application writes a 3 bytes "mailbox" (magic + its own device id) at
@@ -57,20 +78,32 @@
 /* Flash page size of the ATmega328P in bytes */
 #define PJON_BOOT_PAGE_SIZE      128
 
-/* Length of a write command payload: command + 16 bits address + page */
-#define PJON_BOOT_WRITE_LENGTH   (3 + PJON_BOOT_PAGE_SIZE)
+/* Bytes of flash carried by each write command: 16, 32, 64 or 128.
+   Bootloader, uploader and pjon_boot_upload.py must use the same value.
+   With 32 a write packet is at most 48 bytes long (sender info, packet id,
+   port and CRC32 included) so it fits the default PJON_PACKET_MAX_LENGTH. */
+#ifndef PJON_BOOT_CHUNK_SIZE
+  #define PJON_BOOT_CHUNK_SIZE   32
+#endif
+
+#if (PJON_BOOT_CHUNK_SIZE != 16) && (PJON_BOOT_CHUNK_SIZE != 32) && \
+    (PJON_BOOT_CHUNK_SIZE != 64) && (PJON_BOOT_CHUNK_SIZE != 128)
+  #error "PJON_BOOT_CHUNK_SIZE must be 16, 32, 64 or 128"
+#endif
+
+#define PJON_BOOT_CHUNKS_PER_PAGE (PJON_BOOT_PAGE_SIZE / PJON_BOOT_CHUNK_SIZE)
+
+/* Length of a write command payload: command + 16 bits address + chunk */
+#define PJON_BOOT_WRITE_LENGTH   (3 + PJON_BOOT_CHUNK_SIZE)
+
+/* Worst case PJON overhead of a packet sent to the bootloader: id, header,
+   length, CRC8, sender id, packet id (2), port (2), CRC32 (4) */
+#define PJON_BOOT_MAX_OVERHEAD   13
 
 /* Mailbox used to pass the request from application to bootloader */
 #define PJON_BOOT_MAGIC_0        0xB0
 #define PJON_BOOT_MAGIC_1        0x07
 #define PJON_BOOT_MAILBOX_SIZE   3
-
-/* Settings the uploader needs to talk to the bootloader using PJON.
-   A write packet is 142 bytes long and the bootloader acknowledges it only
-   after the page has been erased, written and verified (~9ms), so the
-   uploader needs a longer packet buffer and a longer response timeout. */
-#define PJON_BOOT_UPLOADER_PACKET_MAX_LENGTH   160
-#define PJON_BOOT_UPLOADER_RESPONSE_OFFSET     150
 
 #if defined(__AVR__)
   #include <avr/io.h>

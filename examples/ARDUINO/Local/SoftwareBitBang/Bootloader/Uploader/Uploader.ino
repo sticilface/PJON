@@ -13,17 +13,25 @@
      Uploader -> PC: 'K' if the packet was acknowledged, 'E' if not
    A request with device id 0 and length 0 is answered with 'R' (ready).
    If the bytes of a request are more than 250ms apart the request is
-   discarded, so the PC can always resynchronize. */
+   discarded, so the PC can always resynchronize.
 
-// Write packets are 142 bytes long, a longer buffer is required
-#define PJON_PACKET_MAX_LENGTH PJON_BOOT_UPLOADER_PACKET_MAX_LENGTH
-// The bootloader acknowledges after writing the page (~9ms)
-#define SWBB_RESPONSE_OFFSET PJON_BOOT_UPLOADER_RESPONSE_OFFSET
+   The bootloader acknowledges every packet quickly (pages are confirmed by
+   a ping sent after them), so default PJON settings work: with the default
+   chunk size of 32 bytes the longest packet is 48 bytes. Only a chunk size
+   of 64 or 128 (PJON_BOOT_CHUNK_SIZE, must match the bootloader) needs a
+   longer packet buffer, set below. Optionally define PJON_INCLUDE_PACKET_ID
+   to send packet ids, the bootloader accepts packets with or without. */
+
+#include <utils/bootloader/PJON_Bootloader.h>
+
+#if PJON_BOOT_CHUNK_SIZE > 32 && !defined(PJON_PACKET_MAX_LENGTH)
+  #define PJON_PACKET_MAX_LENGTH \
+    (PJON_BOOT_MAX_OVERHEAD + PJON_BOOT_WRITE_LENGTH + 1)
+#endif
 // Packets are sent with send_packet_blocking, no buffered packets needed
 #define PJON_MAX_PACKETS 1
 #define PJON_INCLUDE_PORT
 
-#include <utils/bootloader/PJON_Bootloader.h>
 #include <PJONSoftwareBitBang.h>
 
 #ifndef BUS_PIN
@@ -36,11 +44,14 @@ PJONSoftwareBitBang bus(PJON_MASTER_ID);
 uint8_t request[2 + PJON_BOOT_WRITE_LENGTH];
 uint16_t received = 0;
 uint32_t last_byte_time = 0;
+uint16_t packet_id = 1;
 
 void setup() {
   bus.strategy.set_pin(BUS_PIN);
-  bus.set_crc_32(true);         // The bootloader accepts only CRC32
-  bus.include_sender_info(false);
+  bus.set_crc_32(true); // The bootloader accepts only CRC32
+  #if PJON_INCLUDE_PACKET_ID
+    bus.set_packet_id(true);
+  #endif
   bus.begin();
   Serial.begin(115200);
 };
@@ -67,9 +78,10 @@ void loop() {
         request + 2,
         request[1],
         PJON_NO_HEADER,
-        0,
+        packet_id++,
         PJON_BOOT_PORT
       );
+      if(!packet_id) packet_id = 1;
       Serial.write((result == PJON_ACK) ? 'K' : 'E');
     }
   }

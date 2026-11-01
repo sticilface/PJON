@@ -2,11 +2,14 @@
 """Helpers used by run_tests.sh (not needed to flash a device).
 
     client.py enter PORT ID            only ask the application to enter the bootloader
-    client.py partial PORT ID HEX N    enter, invalidate page 0, write N pages, stop
+    client.py partial PORT ID HEX N    enter, invalidate page 0, write N pages and
+                                       half of the next one, stop
     client.py protect PORT ID          bootloader already active: check that only
-                                       valid page addresses are accepted
+                                       valid chunk addresses are accepted
+    client.py chunks PORT ID           bootloader already active: check that missing,
+                                       out of order and repeated chunks are handled
     client.py check HEX FLASH_BIN      compare a HEX file with a flash dump
-    client.py large HEX OUT_HEX        HEX followed by pseudo random data up to 0x7BFF
+    client.py large HEX OUT_HEX        HEX followed by pseudo random data up to the bootloader
 """
 
 import importlib.util
@@ -20,7 +23,8 @@ spec = importlib.util.spec_from_file_location(
 up = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(up)
 
-BOOT_START = 0x7C00
+BOOT_START = 0x7800
+CHUNK = 32
 
 
 def connect(port):
@@ -29,9 +33,13 @@ def connect(port):
     return uploader
 
 
-def write(uploader, device_id, address, page):
+def chunk(uploader, device_id, address, data):
     return uploader.send(
-        device_id, up.CMD_WRITE + bytes([address >> 8, address & 0xFF]) + page)
+        device_id, up.CMD_WRITE + bytes([address >> 8, address & 0xFF]) + data)
+
+
+def page(uploader, device_id, address, data):
+    return up.write_page(uploader, device_id, address, data, CHUNK)
 
 
 def enter(uploader, device_id):
@@ -51,29 +59,60 @@ def cmd_partial(port, device_id, hex_path, count):
     pages = up.build_pages(up.parse_hex(hex_path), BOOT_START)
     if not uploader.send(device_id, up.CMD_PING):
         sys.exit("ping: not acknowledged")
-    if not write(uploader, device_id, 0, b"\xFF" * up.PAGE_SIZE):
+    if not page(uploader, device_id, 0, b"\xFF" * up.PAGE_SIZE):
         sys.exit("invalidate page 0: not acknowledged")
-    for address, page in pages[1:1 + int(count)]:
-        if not write(uploader, device_id, address, page):
+    for address, data in pages[1:1 + int(count)]:
+        if not page(uploader, device_id, address, data):
             sys.exit("write 0x%04X: not acknowledged" % address)
-    print("partial: stopped after %s pages" % count)
+    address, data = pages[1 + int(count)]
+    for offset in (0, CHUNK):  # half of the next page
+        if not chunk(uploader, device_id, address + offset, data[offset:offset + CHUNK]):
+            sys.exit("chunk 0x%04X: not acknowledged" % (address + offset))
+    print("partial: stopped after %s pages and 2 chunks" % count)
 
 
 def cmd_protect(port, device_id):
     device_id = int(device_id)
     uploader = connect(port)
-    checks = [  # address, expected acknowledgement
-        (0x7B80, True),    # last application page
-        (0x7C00, False),   # first bootloader page
-        (0x7F80, False),   # last bootloader page
-        (0x0010, False),   # not aligned to a page
+    checks = [  # chunk address, expected acknowledgement
+        (0x77E0, True),    # last chunk of the application area
+        (0x7800, False),   # first chunk of the bootloader
+        (0x7FE0, False),   # last chunk of the bootloader
+        (0x0010, False),   # not aligned to a chunk
     ]
     failed = 0
     for address, expected in checks:
-        acked = write(uploader, device_id, address, b"\x00" * up.PAGE_SIZE)
+        acked = chunk(uploader, device_id, address, b"\x00" * CHUNK)
         failed += acked != expected
         print("write 0x%04X: %s (%s)" % (
             address, "acknowledged" if acked else "refused",
+            "ok" if acked == expected else "WRONG"))
+    sys.exit(1 if failed else 0)
+
+
+def cmd_chunks(port, device_id):
+    device_id = int(device_id)
+    uploader = connect(port)
+    data = bytes(range(128))
+    base = 0x1000
+    sequences = [  # chunk indexes sent, then the ping must be acknowledged?
+        ("all chunks in order", [0, 1, 2, 3], True),
+        ("chunk 2 missing", [0, 1, 3], False),
+        ("chunks 1 and 2 swapped", [0, 2, 1, 3], False),
+        ("first chunk missing", [1, 2, 3], False),
+        ("chunk repeated (lost acknowledgement)", [0, 1, 1, 2, 3, 3], True),
+    ]
+    failed = 0
+    for name, indexes, expected in sequences:
+        for i in indexes:
+            if not chunk(uploader, device_id, base + i * CHUNK,
+                         data[i * CHUNK:(i + 1) * CHUNK]):
+                print("%s: chunk %d not acknowledged (WRONG)" % (name, i))
+                failed += 1
+        acked = uploader.send(device_id, up.CMD_PING)
+        failed += acked != expected
+        print("%s: page %s (%s)" % (
+            name, "confirmed" if acked else "failed",
             "ok" if acked == expected else "WRONG"))
     sys.exit(1 if failed else 0)
 
@@ -104,7 +143,7 @@ def cmd_large(hex_path, out_path):
 if __name__ == "__main__":
     commands = {
         "enter": cmd_enter, "partial": cmd_partial, "protect": cmd_protect,
-        "check": cmd_check, "large": cmd_large,
+        "chunks": cmd_chunks, "check": cmd_check, "large": cmd_large,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
         sys.exit(__doc__)

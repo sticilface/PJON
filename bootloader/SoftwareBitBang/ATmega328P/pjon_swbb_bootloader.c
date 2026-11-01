@@ -3,7 +3,7 @@
 
    Minimal bootloader receiving a firmware image over a single wire PJON bus
    using the SoftwareBitBang strategy (PJDL v5.0). It is written in plain C
-   without the PJON library or the Arduino core so that it fits in 1kB.
+   without the PJON library or the Arduino core so that it fits in 2kB.
 
    Supported (everything else is not needed to flash and is dropped):
    - PJDL frame reception and synchronous acknowledgement, one mode chosen
@@ -11,12 +11,14 @@
    - PJON local mode packets addressed to the bootloader's device id
    - CRC32 packet verification (covers meta-data, the CRC8 is not checked)
    - Optional sender info and packet id (skipped), port PJON_BOOT_PORT
-   - Commands: ping, write page (erase + write + verify), start application
+   - Commands: ping, write a page chunk (the page is erased, written and
+     verified after its last chunk), start application (see
+     src/utils/bootloader/PJON_Bootloader.h for the protocol)
 
    Not supported: shared mode, MAC, extended length, broadcast, routing,
    transmitting packets and medium access (it never starts a transmission,
    it only answers with an acknowledgement), receiving while a page is being
-   written (the uploader waits for the acknowledgement anyway).
+   written (the sender's ping is retried by PJON until the write is over).
 
    Entering the bootloader (the BOOTRST fuse makes it run on every reset):
    - Watchdog reset with a valid mailbox set by the application (see
@@ -72,7 +74,7 @@
   #define EXTRF_TIMEOUT_MS 1000
 #endif
 #ifndef BOOT_START        // Byte address of the bootloader section
-  #define BOOT_START 0x7C00
+  #define BOOT_START 0x7800
 #endif
 
 /* Pin mapping (Arduino numbering, ATmega328P) ----------------------------- */
@@ -151,16 +153,52 @@
 #define PJON_PACKET_ID_BIT  0x80
 
 /* id + header + length + CRC8 + tx id + packet id + port + payload + CRC32 */
-#define BUFFER_LENGTH (4 + 1 + 2 + 2 + PJON_BOOT_WRITE_LENGTH + 4)
+#define BUFFER_LENGTH (PJON_BOOT_MAX_OVERHEAD + PJON_BOOT_WRITE_LENGTH)
 #define MIN_LENGTH    (4 + 2 + 1 + 4)
 
 #if BUFFER_LENGTH > 255
   #error "Packet does not fit in 8 bits length"
 #endif
 
-/* Not initialized: there is no C runtime startup code (-nostartfiles) */
-static uint8_t buffer[BUFFER_LENGTH] __attribute__((section(".noinit")));
-static uint8_t device_id __attribute__((section(".noinit")));
+#if SPM_PAGESIZE != PJON_BOOT_PAGE_SIZE
+  #error "Unexpected flash page size"
+#endif
+
+/* Not initialized: there is no C runtime startup code (-nostartfiles),
+   main() assigns the variables that need an initial value. */
+#define NOINIT __attribute__((section(".noinit")))
+static uint8_t buffer[BUFFER_LENGTH] NOINIT;  // received packet
+static uint8_t page[SPM_PAGESIZE] NOINIT;     // page being assembled
+static uint16_t page_address NOINIT;          // its address, NO_PAGE if none
+static uint8_t next_chunk NOINIT;             // chunks received in order
+static uint8_t last_page_ok NOINIT;           // result of the last page write
+static uint8_t device_id NOINIT;
+
+#define NO_PAGE 0xFFFF
+
+/* Error detection --------------------------------------------------------- */
+
+/* CRC32 (PJON, IEEE 802.3) using a 16 entries table. It is updated while
+   the frame is received, one byte at a time at the start of the next padding
+   bit (~6us at 16MHz, ~12us at 8MHz, shorter than any padding bit minus
+   ACC_US), so the acknowledgement can be sent right after the frame, well
+   within the default PJON response timeout. */
+/* In a .text section rather than PROGMEM: the linker places PROGMEM data
+   before main(), which must stay at the reset address (BOOT_START) */
+static const uint32_t crc32_table[16]
+  __attribute__((used, section(".text.crc32_table"))) = {
+  0x00000000UL, 0x1DB71064UL, 0x3B6E20C8UL, 0x26D930ACUL,
+  0x76DC4190UL, 0x6B6B51F4UL, 0x4DB26158UL, 0x5005713CUL,
+  0xEDB88320UL, 0xF00F9344UL, 0xD6D6A3E8UL, 0xCB61B38CUL,
+  0x9B64C2B0UL, 0x86D3D2D4UL, 0xA00AE278UL, 0xBDBDF21CUL
+};
+
+static uint32_t crc32_update(uint32_t crc, uint8_t b) {
+  crc ^= b;
+  crc = (crc >> 4) ^ pgm_read_dword(&crc32_table[crc & 15]);
+  crc = (crc >> 4) ^ pgm_read_dword(&crc32_table[crc & 15]);
+  return crc;
+}
 
 /* SoftwareBitBang reception ----------------------------------------------- */
 
@@ -198,14 +236,17 @@ static uint8_t read_byte(void) {
 }
 
 /* Receives a frame (3 sync pads then sync pad + byte for each byte).
-   Called when the bus is high. Returns the packet length or 0. */
-static uint8_t receive_frame(void) {
+   Called when the bus is high. Returns the packet length or 0, and in
+   *crc the CRC32 of the packet without its last 4 bytes (the CRC32). */
+static uint8_t receive_frame(uint32_t *crc) {
   uint8_t length = BUFFER_LENGTH, i;
+  uint32_t c = 0xFFFFFFFF;
   if(!sync() || !sync() || !sync()) return 0;
   for(i = 0; i < length; i++) {
     if(!sync()) return 0;
     uint8_t b = read_byte();
     buffer[i] = b;
+    if(i < length - 4) c = crc32_update(c, b);
     if(i == 0) {
       if(b != device_id) return 0;
     } else if(i == 1) {
@@ -217,6 +258,7 @@ static uint8_t receive_frame(void) {
       length = b;
     }
   }
+  *crc = ~c;
   return length;
 }
 
@@ -256,18 +298,6 @@ static void send_ack(void) {
   BUS_RELEASE();
 }
 
-/* Error detection --------------------------------------------------------- */
-
-static uint32_t crc32(const uint8_t *data, uint8_t length) {
-  uint32_t crc = 0xFFFFFFFF;
-  while(length--) {
-    crc ^= *data++;
-    for(uint8_t i = 8; i; i--)
-      crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320 : (crc >> 1);
-  }
-  return ~crc;
-}
-
 /* Flash ------------------------------------------------------------------- */
 
 static uint8_t page_matches(uint16_t address, const uint8_t *data) {
@@ -289,6 +319,38 @@ static uint8_t write_page(uint16_t address, const uint8_t *data) {
   boot_spm_busy_wait();
   boot_rww_enable();
   return page_matches(address, data);
+}
+
+/* Stores a chunk in the page buffer. Returns 0 if the address is invalid
+   (not acknowledged), 1 if the chunk is accepted, 2 if it is the last chunk
+   of the page (acknowledge, then call finish_page). A chunk that is not the
+   next one in order (or a repetition of the previous one) invalidates the
+   page, that then fails in finish_page. */
+static uint8_t store_chunk(uint16_t address, const uint8_t *data) {
+  if((address & (PJON_BOOT_CHUNK_SIZE - 1)) || (address >= BOOT_START))
+    return 0;
+  uint16_t base = address & ~(SPM_PAGESIZE - 1);
+  uint8_t offset = address & (SPM_PAGESIZE - 1);
+  uint8_t index = offset / PJON_BOOT_CHUNK_SIZE;
+  if(!index) { // first chunk, start the page
+    page_address = base;
+    next_chunk = 0;
+  }
+  if(base != page_address) page_address = NO_PAGE;
+  else if(index == next_chunk) next_chunk++;
+  else if(index + 1 != next_chunk) page_address = NO_PAGE;
+  if(page_address != NO_PAGE)
+    for(uint8_t i = 0; i < PJON_BOOT_CHUNK_SIZE; i++)
+      page[offset + i] = data[i];
+  return (index == PJON_BOOT_CHUNKS_PER_PAGE - 1) ? 2 : 1;
+}
+
+/* Writes the page if all its chunks were received in order */
+static void finish_page(void) {
+  last_page_ok =
+    (page_address != NO_PAGE) &&
+    (next_chunk == PJON_BOOT_CHUNKS_PER_PAGE) &&
+    write_page(page_address, page);
 }
 
 /* Application ------------------------------------------------------------- */
@@ -321,6 +383,8 @@ int main(void) {
 
   uint16_t timeout = 0; // 0 = wait forever (only if there is no app)
   device_id = DEVICE_ID;
+  page_address = NO_PAGE;
+  last_page_ok = 1;
   if(
     (reset_flags & (1 << WDRF)) &&
     (magic_0 == PJON_BOOT_MAGIC_0) && (magic_1 == PJON_BOOT_MAGIC_1)
@@ -347,11 +411,11 @@ int main(void) {
       }
     }
     if(!BUS_HIGH()) continue;
-    uint8_t length = receive_frame();
-    if(!length) continue;
     /* The meta-data CRC8 is not checked: the CRC32 covers the whole packet
        (meta-data and CRC8 included) and the length is already bounded */
-    uint32_t crc = crc32(buffer, length - 4);
+    uint32_t crc;
+    uint8_t length = receive_frame(&crc);
+    if(!length) continue;
     uint8_t i = length;
     while((i > length - 4) && (buffer[--i] == (uint8_t)crc)) crc >>= 8;
     if(i > length - 4) continue; // CRC32 is transmitted MSB first
@@ -366,16 +430,19 @@ int main(void) {
     uint8_t *payload = buffer + index;
     uint8_t payload_length = (length - 4) - index;
     uint8_t ok = 0;
-    if(payload_length == 1)
-      ok = (payload[0] == PJON_BOOT_CMD_PING) ||
-           (payload[0] == PJON_BOOT_CMD_GO);
-    else if(
+    if(payload_length == 1) {
+      /* Ping and go are answered only if the last page is in flash */
+      if(
+        (payload[0] == PJON_BOOT_CMD_PING) || (payload[0] == PJON_BOOT_CMD_GO)
+      ) ok = last_page_ok;
+    } else if(
       (payload_length == PJON_BOOT_WRITE_LENGTH) &&
       (payload[0] == PJON_BOOT_CMD_WRITE)
-    ) ok = write_page((payload[1] << 8) | payload[2], payload + 3);
-    if(!ok) continue; // No acknowledgement, the uploader will retry
+    ) ok = store_chunk((payload[1] << 8) | payload[2], payload + 3);
+    if(!ok) continue; // No acknowledgement, the sender will retry
     if(header & PJON_ACK_REQ_BIT) send_ack();
     remaining = timeout;
-    if(payload[0] == PJON_BOOT_CMD_GO) start_app();
+    if(ok == 2) finish_page(); // After the acknowledgement: no long wait
+    else if(payload[0] == PJON_BOOT_CMD_GO) start_app();
   }
 }

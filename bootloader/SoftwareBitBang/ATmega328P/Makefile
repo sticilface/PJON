@@ -13,7 +13,11 @@
 #   EXTRF_TIMEOUT_MS  Time spent in the bootloader after a reset pin reset,
 #                     0 disables entering the bootloader this way       [1000]
 #   F_CPU             Clock frequency in Hz                         [16000000]
-#   BOOT_SIZE         Bootloader section size in bytes, 1024/2048/4096  [1024]
+#   BOOT_SIZE         Bootloader section size in bytes, 2048 or 4096   [2048]
+#                     (1024 is accepted but the bootloader no longer fits)
+#   CHUNK_SIZE        Bytes of flash per write packet, 16/32/64/128       [32]
+#                     (must match the uploader, see PJON_Bootloader.h)
+#   EESAVE            1 keeps the EEPROM content on chip erase            [1]
 #   ISP / ISP_PORT    avrdude programmer and port for "make flash"
 #   AVRDUDE_FLAGS     extra avrdude options, e.g. "-b 19200" for ArduinoISP
 
@@ -23,7 +27,9 @@ MODE             ?= 1
 TIMEOUT_MS       ?= 5000
 EXTRF_TIMEOUT_MS ?= 1000
 F_CPU            ?= 16000000
-BOOT_SIZE        ?= 1024
+BOOT_SIZE        ?= 2048
+CHUNK_SIZE       ?= 32
+EESAVE           ?= 1
 ISP              ?= usbasp
 ISP_PORT         ?= usb
 AVRDUDE_FLAGS    ?=
@@ -32,18 +38,25 @@ MCU     = atmega328p
 TARGET  = pjon_swbb_bootloader
 PJON_SRC = ../../../src
 
-# BOOTSZ fuse bits and high fuse (SPIEN on, BOOTRST on, EESAVE off)
+# BOOTSZ fuse bits and high fuse (SPIEN on, BOOTRST on, EESAVE as chosen)
 ifeq ($(BOOT_SIZE),1024)
   BOOT_START = 0x7C00
-  HFUSE      = 0xDC
+  HFUSE_BASE = 0xDC
 else ifeq ($(BOOT_SIZE),2048)
   BOOT_START = 0x7800
-  HFUSE      = 0xDA
+  HFUSE_BASE = 0xDA
 else ifeq ($(BOOT_SIZE),4096)
   BOOT_START = 0x7000
-  HFUSE      = 0xD8
+  HFUSE_BASE = 0xD8
 else
   $(error BOOT_SIZE must be 1024, 2048 or 4096)
+endif
+
+# EESAVE is bit 3 of the high fuse, programmed (0) keeps the EEPROM
+ifeq ($(EESAVE),1)
+  HFUSE = $(shell printf '0x%02X' $$(( $(HFUSE_BASE) & 0xF7 )))
+else
+  HFUSE = $(HFUSE_BASE)
 endif
 
 # External crystal >8MHz, slow rising power; brown-out at 2.7V
@@ -59,10 +72,13 @@ CFLAGS  = -mmcu=$(MCU) -DF_CPU=$(F_CPU)UL -Os -std=gnu99 -Wall -Wextra \
           -fno-split-wide-types -mrelax -I$(PJON_SRC) \
           -DPJON_PIN=$(PJON_PIN) -DDEVICE_ID=$(DEVICE_ID) -DMODE=$(MODE) \
           -DTIMEOUT_MS=$(TIMEOUT_MS) -DEXTRF_TIMEOUT_MS=$(EXTRF_TIMEOUT_MS) \
-          -DBOOT_START=$(BOOT_START)
+          -DBOOT_START=$(BOOT_START) -DPJON_BOOT_CHUNK_SIZE=$(CHUNK_SIZE)
 LDFLAGS = -nostartfiles -Wl,--section-start=.text=$(BOOT_START) -Wl,--relax
 
 all: $(TARGET).hex size
+
+fuses:
+	@echo "lfuse $(LFUSE) hfuse $(HFUSE) efuse $(EFUSE) boot start $(BOOT_START)"
 
 $(TARGET).elf: $(TARGET).c $(PJON_SRC)/utils/bootloader/PJON_Bootloader.h \
                Makefile
@@ -80,6 +96,11 @@ size: $(TARGET).elf
 	if [ $$bytes -gt $(BOOT_SIZE) ]; then \
 	  echo "ERROR: bootloader does not fit in BOOT_SIZE=$(BOOT_SIZE)"; \
 	  rm -f $(TARGET).hex; exit 1; \
+	fi; \
+	entry=$$(avr-nm $< | awk '$$3 == "main" {print $$1}'); \
+	if [ $$((0x$$entry)) -ne $$(($(BOOT_START))) ]; then \
+	  echo "ERROR: main() is at 0x$$entry, not at BOOT_START $(BOOT_START)"; \
+	  rm -f $(TARGET).hex; exit 1; \
 	fi
 
 flash: $(TARGET).hex size
@@ -90,4 +111,4 @@ flash: $(TARGET).hex size
 clean:
 	rm -f $(TARGET).elf $(TARGET).hex $(TARGET).lst
 
-.PHONY: all size flash clean
+.PHONY: all size fuses flash clean
