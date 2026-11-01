@@ -35,7 +35,8 @@
   MODE   1: 1.97kB/s - 15808Bd
   MODE   2: 2.21kB/s - 17696Bd
   MODE   3: 3.10kB/s - 24844Bd
-  MODE   4: 3.34kB/s - 26755Bd */
+  MODE   4: 3.34kB/s - 26755Bd
+  MODE   5: 6.3kB/s, MODE 6: 8.2kB/s (not PJDL, SWBB_PIN only, see Timing.h) */
 #include "Timing.h"
 
 // Recommended receive time for this strategy, in microseconds
@@ -287,7 +288,9 @@ class SoftwareBitBang {
     static uint8_t read_byte() {
       uint8_t value = 0, i = 8;
       uint16_t n;
-      __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_RX_BIT) / 2);
+      __builtin_avr_delay_cycles(
+        (SWBB_CYCLES(SWBB_RX_BIT) / 2) - (SWBB_SAMPLE_ADVANCE / 2)
+      );
       __asm__ __volatile__ (
         "1: lsr  %[v]               \n\t"
         "   sbic %[in], %[bit]      \n\t"
@@ -333,7 +336,9 @@ class SoftwareBitBang {
       if(!left) return false;
       if((uint16_t)(max_high - left + late) < SWBB_LOOPS(SWBB_ACCEPTANCE))
         return false;
-      __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_RX_BIT / 2));
+      __builtin_avr_delay_cycles(
+        SWBB_CYCLES(SWBB_RX_BIT / 2) - (SWBB_SAMPLE_ADVANCE / 2)
+      );
       if(bus_high()) return false;
       __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_RX_BIT / 2));
       _end = TCNT0;

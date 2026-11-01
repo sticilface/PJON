@@ -17,6 +17,8 @@
    MODE   2: 2.21kB/s - 17696Bd
    MODE   3: 3.10kB/s - 24844Bd
    MODE   4: 3.34kB/s - 26755Bd
+   MODE   5: 6.3kB/s (data bit 12us, padding bit 50us, SWBB_PIN only)
+   MODE   6: 8.2kB/s (data bit 8us, padding bit 50us, SWBB_PIN only)
 
    Use the same pin number on all connected devices to achieve maximum
    timing efficiency, not all different pin combinations work nominally
@@ -268,6 +270,47 @@
   #endif
 #endif
 
+/* Modes 5 and 6 (faster than PJDL v5.0, not part of the specification) are
+   supported only by the direct port access implementation (SWBB_PIN) and by
+   the bootloader: the portable implementation can not produce or sample
+   such short bits with digitalRead and digitalWrite. All devices of the bus
+   must use the same mode. The padding bit is not shortened in proportion to
+   the data bit: between bytes the receiver serves pending interrupts and
+   PJON processes the received byte, the padding bit must still be high when
+   it is ready (50us is enough with a 15us interrupt handler every 256us).
+   The bus range is shorter than in mode 4, it was not measured: the values
+   were chosen in simulation, which does not model the cable (see
+   REVIEW-swbb-fast-modes.md). */
+
+#if (SWBB_MODE == 5) || (SWBB_MODE == 6)
+  #ifndef SWBB_PIN
+    #error "SWBB_MODE 5 and 6 require SWBB_PIN (direct port access)"
+  #endif
+  #if SWBB_MODE == 5
+    #ifndef SWBB_MODE5_PAD
+      #define SWBB_MODE5_PAD   50
+      #define SWBB_MODE5_BIT   12
+      #define SWBB_MODE5_ACC   16
+    #endif
+    #define SWBB_BIT_WIDTH     SWBB_MODE5_BIT
+    #define SWBB_BIT_SPACER    SWBB_MODE5_PAD
+    #define SWBB_ACCEPTANCE    SWBB_MODE5_ACC
+  #else
+    #ifndef SWBB_MODE6_PAD
+      #define SWBB_MODE6_PAD   50
+      #define SWBB_MODE6_BIT    8
+      #define SWBB_MODE6_ACC   12
+    #endif
+    #define SWBB_BIT_WIDTH     SWBB_MODE6_BIT
+    #define SWBB_BIT_SPACER    SWBB_MODE6_PAD
+    #define SWBB_ACCEPTANCE    SWBB_MODE6_ACC
+  #endif
+  #define SWBB_READ_DELAY      0
+  #ifndef SWBB_LATENCY
+    #define SWBB_LATENCY       5
+  #endif
+#endif
+
 /* Avoid error if any previous defined ------------------------------------ */
 #if SWBB_MODE == 1
   #ifndef SWBB_BIT_WIDTH
@@ -364,6 +407,10 @@
   #define SWBB_WIRE_PAD_DEFAULT         65
   #define SWBB_WIRE_BIT_DEFAULT         26
   #define SWBB_WIRE_KEEP_BUSY_DEFAULT  6.5
+#elif (SWBB_MODE == 5) || (SWBB_MODE == 6)
+  #define SWBB_WIRE_PAD_DEFAULT       SWBB_BIT_SPACER
+  #define SWBB_WIRE_BIT_DEFAULT       SWBB_BIT_WIDTH
+  #define SWBB_WIRE_KEEP_BUSY_DEFAULT    4
 #endif
 
 #ifndef SWBB_WIRE_PAD
@@ -385,6 +432,28 @@
    to last SWBB_WIRE_BIT + 0.5, in the middle between what the portable
    implementation (~SWBB_WIRE_BIT + 0.2), the bootloader (SWBB_WIRE_BIT) and
    this implementation (SWBB_WIRE_BIT + 1) transmit. */
+
+#if SWBB_MODE >= 5
+  /* Only exact implementations support modes 5 and 6: no offset */
+  #ifndef SWBB_TX_BIT
+    #define SWBB_TX_BIT SWBB_WIRE_BIT
+  #endif
+  #ifndef SWBB_RX_BIT
+    #define SWBB_RX_BIT SWBB_WIRE_BIT
+  #endif
+#endif
+/* Cycles executed between the detection of the falling edge of a padding
+   bit and the sampling of the first data bit (the receiver samples this much
+   later than the middle of each bit). Compensated only in modes 5 and 6,
+   where it is a significant fraction of a bit (modes 1-4 were validated with
+   it, their timing is unchanged). */
+#ifndef SWBB_SAMPLE_ADVANCE
+  #if SWBB_MODE >= 5
+    #define SWBB_SAMPLE_ADVANCE 50
+  #else
+    #define SWBB_SAMPLE_ADVANCE 0
+  #endif
+#endif
 
 #ifndef SWBB_TX_BIT
   #define SWBB_TX_BIT (SWBB_WIRE_BIT + 1)

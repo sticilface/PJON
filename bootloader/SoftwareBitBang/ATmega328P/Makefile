@@ -7,7 +7,9 @@
 #   PJON_PIN          Arduino pin number of the PJON bus, 0-19 (A0=14)  [12]
 #   DEVICE_ID         Device id used when the application does not pass one,
 #                     e.g. after a reset pin reset or with no application [44]
-#   MODE              PJDL/SoftwareBitBang mode 1-4 (must match the bus)  [1]
+#   MODE              SoftwareBitBang mode 1-6 (must match the bus)       [1]
+#                     5 and 6 are faster modes, the devices must use the
+#                     SoftwareBitBang direct port access (SWBB_PIN)
 #   TIMEOUT_MS        Time spent in the bootloader after the application
 #                     requested it, restarted by each valid command    [5000]
 #   EXTRF_TIMEOUT_MS  Time spent in the bootloader after a reset pin reset,
@@ -36,6 +38,7 @@ AVRDUDE_FLAGS    ?=
 
 MCU     = atmega328p
 TARGET  = pjon_swbb_bootloader
+SOURCE  ?= $(TARGET).c
 PJON_SRC = ../../../src
 
 # BOOTSZ fuse bits and high fuse (SPIEN on, BOOTRST on, EESAVE as chosen)
@@ -80,7 +83,7 @@ all: $(TARGET).hex size
 fuses:
 	@echo "lfuse $(LFUSE) hfuse $(HFUSE) efuse $(EFUSE) boot start $(BOOT_START)"
 
-$(TARGET).elf: $(TARGET).c $(PJON_SRC)/utils/bootloader/PJON_Bootloader.h \
+$(TARGET).elf: $(SOURCE) $(PJON_SRC)/utils/bootloader/PJON_Bootloader.h \
                Makefile
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 

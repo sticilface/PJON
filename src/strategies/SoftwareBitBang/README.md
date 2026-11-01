@@ -44,6 +44,10 @@ It is suggested to add 8kΩ-5MΩ pull-down resistor as shown in the graph above 
 | `2`  | 2.21kB/s | 1600m | ATtiny84/84A/85, ATmega88/168/328/328PB/16u4/32u4/2560, STM32F1 |
 | `3`  | 3.10kB/s | 1200m | ATtiny84/84A/85, ATmega88/168/328, STM32F1 |
 | `4`  | 3.34kB/s |  800m | ATtiny84/84A/85, ATmega88/168/328, STM32F1 |
+| `5`  | 6.3kB/s  | not measured | ATmega88/168/328 with `SWBB_PIN` only |
+| `6`  | 8.2kB/s  | not measured | ATmega88/168/328 with `SWBB_PIN` only |
+
+Modes 5 and 6 are not part of PJDL v5.0: they need the [direct port access](#direct-port-access-atmega88168328) implementation on every device of the bus (and the bootloader built with the same `MODE`). They were validated only in simulation, which does not model the cable: test them on the real bus before using them, see [REVIEW-swbb-fast-modes.md](/REVIEW-swbb-fast-modes.md).
 
 When including and using the `SoftwareBitBang` strategy you have the complete access to the microcontroller. This happens because `SoftwareBitBang` runs a completely software-defined implementation, transforming a painful walk in a nice flight.
 
@@ -65,7 +69,7 @@ Before including the library it is possible to configure `SoftwareBitBang` using
 
 | Constant                | Purpose                              | Supported value                            |
 | ----------------------- |------------------------------------- | ------------------------------------------ |
-| `SWBB_MODE`             | Data transmission mode               | 1, 2, 3, 4                                 |
+| `SWBB_MODE`             | Data transmission mode               | 1, 2, 3, 4 (5, 6 with `SWBB_PIN`)          |
 | `SWBB_BACK_OFF_DEGREE`  | Maximum back-off exponential degree  | Numeric value (4 by default)               |
 | `SWBB_MAX_ATTEMPTS`     | Maximum transmission attempts        | Numeric value (20 by default)              |
 | `SWBB_PREAMBLE`         | Preamble Length                      | Numeric value (1 by default), max 100      |

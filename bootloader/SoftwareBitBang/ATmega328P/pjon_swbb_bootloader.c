@@ -107,34 +107,100 @@
 
 /* PJDL v5.0 timing, as transmitted on the wire (microseconds) ------------- */
 
+/* Modes 5 and 6 are faster modes supported only by this bootloader and the
+   SoftwareBitBang direct port access implementation (SWBB_PIN), see
+   src/strategies/SoftwareBitBang/Timing.h. Each value can be overridden at
+   build time (-DPAD_US=... etc.), it must then match the other devices. */
+#ifndef MODE5_PAD_US
+  #define MODE5_PAD_US 50
+  #define MODE5_BIT_US 12
+  #define MODE5_ACC_US 16
+#endif
+#ifndef MODE6_PAD_US
+  #define MODE6_PAD_US 50
+  #define MODE6_BIT_US  8
+  #define MODE6_ACC_US 12
+#endif
 #if MODE == 1
-  #define PAD_US 110
-  #define BIT_US  44
-  #define ACC_US  56
+  #define PAD_DEFAULT_US 110
+  #define BIT_DEFAULT_US  44
+  #define ACC_DEFAULT_US  56
 #elif MODE == 2
-  #define PAD_US  92
-  #define BIT_US  40
-  #define ACC_US  56
+  #define PAD_DEFAULT_US  92
+  #define BIT_DEFAULT_US  40
+  #define ACC_DEFAULT_US  56
 #elif MODE == 3
-  #define PAD_US  70
-  #define BIT_US  28
-  #define ACC_US  30
+  #define PAD_DEFAULT_US  70
+  #define BIT_DEFAULT_US  28
+  #define ACC_DEFAULT_US  30
 #elif MODE == 4
-  #define PAD_US  65
-  #define BIT_US  26
-  #define ACC_US  30
+  #define PAD_DEFAULT_US  65
+  #define BIT_DEFAULT_US  26
+  #define ACC_DEFAULT_US  30
+#elif MODE == 5
+  #define PAD_DEFAULT_US  MODE5_PAD_US
+  #define BIT_DEFAULT_US  MODE5_BIT_US
+  #define ACC_DEFAULT_US  MODE5_ACC_US
+#elif MODE == 6
+  #define PAD_DEFAULT_US  MODE6_PAD_US
+  #define BIT_DEFAULT_US  MODE6_BIT_US
+  #define ACC_DEFAULT_US  MODE6_ACC_US
 #else
-  #error "MODE must be 1, 2, 3 or 4"
+  #error "MODE must be 1, 2, 3, 4, 5 or 6"
+#endif
+#ifndef PAD_US
+  #define PAD_US PAD_DEFAULT_US
+#endif
+#ifndef BIT_US
+  #define BIT_US BIT_DEFAULT_US
+#endif
+#ifndef ACC_US
+  #define ACC_US ACC_DEFAULT_US
+#endif
+
+/* Data bit duration expected when receiving and transmitted (the ACK), the
+   same as the SoftwareBitBang direct port access implementation (SWBB_RX_BIT
+   and SWBB_TX_BIT in Timing.h): devices using digitalRead sample with a
+   period slightly longer than BIT_US, transmitting BIT_US + 1 suits both
+   them and the exact implementations; receiving at BIT_US + 0.5 is in the
+   middle of what the different implementations transmit. */
+#if MODE >= 5 // only exact implementations support modes 5 and 6
+  #ifndef RX_BIT_US
+    #define RX_BIT_US BIT_US
+  #endif
+  #ifndef TX_BIT_US
+    #define TX_BIT_US BIT_US
+  #endif
+#endif
+#ifndef RX_BIT_US
+  #define RX_BIT_US (BIT_US + 0.5)
+#endif
+
+/* Cycles executed between the detection of the falling edge of a padding bit
+   and the sampling of the first data bit, compensated in modes 5 and 6 only
+   (modes 1-4 were validated without compensation) */
+#ifndef SAMPLE_ADVANCE
+  #if MODE >= 5
+    #define SAMPLE_ADVANCE 40
+  #else
+    #define SAMPLE_ADVANCE 0
+  #endif
+#endif
+#ifndef TX_BIT_US
+  #define TX_BIT_US (BIT_US + 1)
 #endif
 
 /* Longest acceptable padding bit (PJDL tolerance is +17us) */
 #define PAD_MAX_US (PAD_US + 20)
 
 /* Timer1 runs at F_CPU / 8 and is used to measure durations */
-#define TICKS(us) ((uint16_t)(((uint32_t)(us) * (F_CPU / 1000000UL)) / 8))
-#define CYCLES(us) ((uint32_t)(us) * (F_CPU / 1000000UL))
-#define CYCLES_BIT CYCLES(BIT_US)
+#define TICKS(us) ((uint16_t)((us) * (F_CPU / 1000000.0) / 8))
+#define CYCLES(us) ((uint32_t)((us) * (F_CPU / 1000000.0)))
 #define CYCLES_PAD CYCLES(PAD_US)
+
+/* Data bit loops (assembly): OVERHEAD cycles + 4 per iteration + nops */
+#define BIT_LOOPS(BIT, OVERHEAD) ((CYCLES(BIT) - (OVERHEAD)) / 4)
+#define BIT_NOPS(BIT, OVERHEAD) ((CYCLES(BIT) - (OVERHEAD)) % 4)
 
 /* Number of timer overflows (every 524288 cycles) for a timeout */
 #define OVERFLOWS(ms) \
@@ -172,6 +238,7 @@ static uint8_t page[SPM_PAGESIZE] NOINIT;     // page being assembled
 static uint16_t page_address NOINIT;          // its address, NO_PAGE if none
 static uint8_t next_chunk NOINIT;             // chunks received in order
 static uint8_t last_page_ok NOINIT;           // result of the last page write
+static uint16_t byte_end NOINIT;              // Timer1 at the end of a byte
 static uint8_t device_id NOINIT;
 
 #define NO_PAGE 0xFFFF
@@ -180,9 +247,10 @@ static uint8_t device_id NOINIT;
 
 /* CRC32 (PJON, IEEE 802.3) using a 16 entries table. It is updated while
    the frame is received, one byte at a time at the start of the next padding
-   bit (~6us at 16MHz, ~12us at 8MHz, shorter than any padding bit minus
-   ACC_US), so the acknowledgement can be sent right after the frame, well
-   within the default PJON response timeout. */
+   bit (~6us at 16MHz, ~12us at 8MHz; the padding bit is measured from the
+   end of the previous byte, so this time is not lost), so the
+   acknowledgement can be sent right after the frame, well within the default
+   PJON response timeout. */
 /* In a .text section rather than PROGMEM: the linker places PROGMEM data
    before main(), which must stay at the reset address (BOOT_START) */
 static const uint32_t crc32_table[16]
@@ -205,33 +273,59 @@ static uint32_t crc32_update(uint32_t crc, uint8_t b) {
 /* Synchronization pad: a high padding bit followed by a low data bit.
    Returns 1 at the end of the low bit if the pattern is recognised.
    If the bus is still low (the previous bit was a 0 slightly longer than
-   expected) the rising edge is awaited for up to one bit. */
-static uint8_t sync(void) {
+   expected) the rising edge is awaited for up to one bit. If continued, the
+   padding bit started at the end of the previous byte or pad (byte_end): if
+   the bus is already high it is measured from there, so the time spent
+   updating the CRC32 between bytes is not subtracted from it. */
+static uint8_t sync(uint8_t continued) {
   uint16_t start = TCNT1, elapsed;
   BUS_RELEASE();
-  while(!BUS_HIGH())
-    if((uint16_t)(TCNT1 - start) > TICKS(BIT_US)) return 0;
-  start = TCNT1;
+  if(BUS_HIGH()) {
+    if(continued) start = byte_end;
+  } else {
+    while(!BUS_HIGH())
+      if((uint16_t)(TCNT1 - start) > TICKS(RX_BIT_US)) return 0;
+    start = TCNT1;
+  }
   do elapsed = TCNT1 - start;
   while(BUS_HIGH() && (elapsed <= TICKS(PAD_MAX_US)));
-  if(elapsed < TICKS(ACC_US)) return 0;
-  __builtin_avr_delay_cycles(CYCLES_BIT / 2);
+  if((elapsed < TICKS(ACC_US)) || (elapsed > TICKS(PAD_MAX_US))) return 0;
+  __builtin_avr_delay_cycles((CYCLES(RX_BIT_US) / 2) - (SAMPLE_ADVANCE / 2));
   if(BUS_HIGH()) return 0;
-  __builtin_avr_delay_cycles(CYCLES_BIT / 2);
+  __builtin_avr_delay_cycles(CYCLES(RX_BIT_US) / 2);
+  byte_end = TCNT1;
   return 1;
 }
 
-/* Reads 8 bits LSB first sampling in the middle of each bit */
+/* Reads 8 bits LSB first sampling in the middle of each bit. The bit loop is
+   written in assembly so its duration is exact:
+   8 cycles + 4 * BIT_LOOPS + BIT_NOPS = 1 data bit */
 static uint8_t read_byte(void) {
   uint8_t value = 0, i = 8;
-  __builtin_avr_delay_cycles(CYCLES_BIT / 2);
-  for(;;) {
-    value >>= 1;
-    if(BUS_HIGH()) value |= 0x80;
-    if(!--i) break;
-    __builtin_avr_delay_cycles(CYCLES_BIT - 7); // minus loop overhead
-  }
-  __builtin_avr_delay_cycles(CYCLES_BIT / 2);
+  uint16_t n;
+  __builtin_avr_delay_cycles((CYCLES(RX_BIT_US) / 2) - (SAMPLE_ADVANCE / 2));
+  __asm__ __volatile__ (
+    "1: lsr  %[v]                 \n\t"
+    "   sbic %[in], %[bit]        \n\t"
+    "   ori  %[v], 0x80           \n\t"
+    "   dec  %[i]                 \n\t"
+    "   breq 3f                   \n\t"
+    "   ldi  %A[n], lo8(%[loops]) \n\t"
+    "   ldi  %B[n], hi8(%[loops]) \n\t"
+    "2: sbiw %[n], 1              \n\t"
+    "   brne 2b                   \n\t"
+    "   .rept %[nops]             \n\t"
+    "   nop                       \n\t"
+    "   .endr                     \n\t"
+    "   rjmp 1b                   \n\t"
+    "3:                           \n\t"
+    : [v] "+d" (value), [i] "+r" (i), [n] "=&w" (n)
+    : [in] "I" (_SFR_IO_ADDR(BUS_IN)), [bit] "I" (BUS_BIT),
+      [loops] "i" (BIT_LOOPS(RX_BIT_US, 8)),
+      [nops] "i" (BIT_NOPS(RX_BIT_US, 8))
+  );
+  __builtin_avr_delay_cycles(CYCLES(RX_BIT_US) / 2);
+  byte_end = TCNT1;
   return value;
 }
 
@@ -241,9 +335,9 @@ static uint8_t read_byte(void) {
 static uint8_t receive_frame(uint32_t *crc) {
   uint8_t length = BUFFER_LENGTH, i;
   uint32_t c = 0xFFFFFFFF;
-  if(!sync() || !sync() || !sync()) return 0;
+  if(!sync(0) || !sync(1) || !sync(1)) return 0;
   for(i = 0; i < length; i++) {
-    if(!sync()) return 0;
+    if(!sync(1)) return 0;
     uint8_t b = read_byte();
     buffer[i] = b;
     if(i < length - 4) c = crc32_update(c, b);
@@ -269,7 +363,7 @@ static void send_pad(void) {
   BUS_DRIVE(); // Set high before driving, never pull against a high pulse
   __builtin_avr_delay_cycles(CYCLES_PAD);
   BUS_CLEAR();
-  __builtin_avr_delay_cycles(CYCLES_BIT);
+  __builtin_avr_delay_cycles(CYCLES(TX_BIT_US));
 }
 
 /* The transmitter keeps the bus busy with short high pulses while waiting:
@@ -281,20 +375,35 @@ static void send_pad(void) {
 #define RESPONSE_DELAY_US 18
 #define PULSE_WAIT_US    100
 static void send_ack(void) {
-  uint16_t start = TCNT1;
-  uint8_t value = PJON_ACK, i;
+  uint16_t start = TCNT1, n;
+  uint8_t value = PJON_ACK, i = 8;
   while(!BUS_HIGH() && ((uint16_t)(TCNT1 - start) < TICKS(PULSE_WAIT_US)));
   start = TCNT1;
   while(BUS_HIGH() && ((uint16_t)(TCNT1 - start) < TICKS(BIT_US / 2)));
   __builtin_avr_delay_cycles(CYCLES(RESPONSE_DELAY_US));
   send_pad();
   send_pad();
-  for(i = 8; i; i--) {
-    if(value & 1) BUS_SET();
-    else BUS_CLEAR();
-    value >>= 1;
-    __builtin_avr_delay_cycles(CYCLES_BIT - 8); // minus loop overhead
-  }
+  /* 11 cycles + 4 * BIT_LOOPS + BIT_NOPS = 1 data bit */
+  __asm__ __volatile__ (
+    "1: sbrc %[b], 0              \n\t"
+    "   sbi  %[port], %[bit]      \n\t"
+    "   sbrs %[b], 0              \n\t"
+    "   cbi  %[port], %[bit]      \n\t"
+    "   lsr  %[b]                 \n\t"
+    "   ldi  %A[n], lo8(%[loops]) \n\t"
+    "   ldi  %B[n], hi8(%[loops]) \n\t"
+    "2: sbiw %[n], 1              \n\t"
+    "   brne 2b                   \n\t"
+    "   .rept %[nops]             \n\t"
+    "   nop                       \n\t"
+    "   .endr                     \n\t"
+    "   dec  %[i]                 \n\t"
+    "   brne 1b                   \n\t"
+    : [b] "+r" (value), [i] "+r" (i), [n] "=&w" (n)
+    : [port] "I" (_SFR_IO_ADDR(BUS_PORT)), [bit] "I" (BUS_BIT),
+      [loops] "i" (BIT_LOOPS(TX_BIT_US, 11)),
+      [nops] "i" (BIT_NOPS(TX_BIT_US, 11))
+  );
   BUS_RELEASE();
 }
 

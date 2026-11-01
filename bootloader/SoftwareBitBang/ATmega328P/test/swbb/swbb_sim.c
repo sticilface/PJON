@@ -6,6 +6,9 @@
      -t seconds  maximum simulated time (default 10)
      -e          print every bus level change (microseconds, who drives)
      -h          print a histogram of high/low durations per driver
+     -r address  node B starts at this address (a bootloader), it is not
+                 expected to print DONE
+     -F hz       node B clock frequency (default 16000000)
    The USART0 output of each node is printed prefixed by "A: " or "B: ".
    The simulation ends when both nodes printed a line starting with "DONE"
    or when the maximum time is reached. Exit code 0 if both printed DONE. */
@@ -68,8 +71,9 @@ static uint32_t hist[3][2][HMAX];
 int main(int argc, char **argv) {
   const char *hex[2] = {NULL, NULL};
   int bus_pin = 2, trace = 0, histo = 0, opt;
+  long b_reset = -1, b_frequency = 16000000;
   double max_seconds = 10;
-  while((opt = getopt(argc, argv, "a:b:B:t:eh")) != -1) {
+  while((opt = getopt(argc, argv, "a:b:B:t:ehr:F:")) != -1) {
     switch(opt) {
       case 'a': hex[0] = optarg; break;
       case 'b': hex[1] = optarg; break;
@@ -77,6 +81,8 @@ int main(int argc, char **argv) {
       case 't': max_seconds = atof(optarg); break;
       case 'e': trace = 1; break;
       case 'h': histo = 1; break;
+      case 'r': b_reset = strtol(optarg, NULL, 0); break;
+      case 'F': b_frequency = atol(optarg); break;
       default: return 2;
     }
   }
@@ -94,6 +100,13 @@ int main(int argc, char **argv) {
     node[n]->frequency = 16000000;
     node[n]->log = LOG_WARNING;
     load(node[n], hex[n]);
+    if(n == 1) {
+      node[n]->frequency = b_frequency;
+      if(b_reset >= 0) {
+        node[n]->reset_pc = node[n]->pc = b_reset;
+        done[1] = 1;
+      }
+    }
     avr_irq_t *irq = avr_io_getirq(node[n], AVR_IOCTL_UART_GETIRQ('0'),
       UART_IRQ_OUTPUT);
     avr_irq_register_notify(irq, uart_out, (void *)(intptr_t)n);

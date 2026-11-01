@@ -16,6 +16,10 @@
 # Environment:
 #   DIRECT_IO=1     build the sketches with SWBB_PIN (direct port access)
 #   SKETCH_FLAGS    extra compiler flags for the sketches
+#   ORIG_SRC        build the sketches with the PJON library in this
+#                   directory (e.g. a previous version) instead of ../src
+#   BL_SOURCE       build this bootloader source (absolute path) instead of
+#                   pjon_swbb_bootloader.c (e.g. a previous version)
 
 set -u
 cd "$(dirname "$0")"
@@ -37,7 +41,7 @@ CXXFLAGS="-mmcu=atmega328p -Os -std=gnu++11 -fno-exceptions -fno-rtti
 sketch() {
   local ino=$1 out=$2
   shift 2
-  avr-g++ $CXXFLAGS -DF_CPU=16000000UL "$@" -x c++ "$ino" -x none \
+  avr-g++ ${ORIG_SRC:+-I$ORIG_SRC} $CXXFLAGS -DF_CPU=16000000UL "$@" -x c++ "$ino" -x none \
     "$HERE/arduino/arduino_shim.cpp" "$HERE/app_marker.cpp" \
     -o "$BUILD/$out.elf" || exit 1
   avr-objcopy -O ihex -R .eeprom "$BUILD/$out.elf" "$BUILD/$out.hex"
@@ -49,6 +53,7 @@ build() {
   local name=$1 pin=$2 mode=$3 fcpu=$4 extra=${5:-}
   make -s -C "$BL_DIR" clean
   make -s -C "$BL_DIR" PJON_PIN=$pin MODE=$mode F_CPU=$fcpu DEVICE_ID=$ID \
+    ${BL_SOURCE:+SOURCE=$BL_SOURCE} \
     || exit 1
   cp "$BL_DIR/pjon_swbb_bootloader.hex" "$BUILD/$name-bootloader.hex"
   make -s -C "$BL_DIR" clean
@@ -194,6 +199,25 @@ test_8mhz() {
   result $?
 }
 
+test_fast_modes() {
+  for mode in 5 6; do
+    echo "mode_$mode: full update using the fast mode $mode (SWBB_PIN, pin 2)"
+    build fm$mode 2 $mode 16000000 "-DSWBB_PIN=2"
+    upload_test fm$mode 2
+    result $?
+  done
+  echo "mode_5_8mhz: fast mode 5, bootloader at 8MHz, fresh chip upload"
+  build f8m5 2 5 8000000 "-DSWBB_PIN=2"
+  start_sim f8m5 2 -F 8000000 -m 2 -t 120
+  $UPLOAD --port "$PTY" --id $ID --no-enter --reply-timeout 60 \
+    "$BUILD/f8m5-app_v2.hex" | tr '\r' '\n' | grep -v '^writing' \
+    | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  [ $up -eq 0 ] && [ $sim -eq 0 ]
+  result $?
+}
+
 test_large_image() {
   echo "large_image: application area filled up to the bootloader (30kB)"
   build m1 12 1 16000000
@@ -239,7 +263,7 @@ gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/sim" sim.c \
   -lsimavrparts -lsimavr -lelf -lpthread -lutil || exit 1
 
 TESTS=${*:-hook_upload timeout fresh_chip interrupted pins modes 8mhz \
-  large_image protection router chunks}
+  large_image protection router chunks fast_modes}
 for t in $TESTS; do "test_$t"; done
 echo "passed: $PASSED, failed: $FAILED"
 [ $FAILED -eq 0 ]
