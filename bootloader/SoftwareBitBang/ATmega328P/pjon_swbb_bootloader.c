@@ -20,6 +20,8 @@
      written at ISP time) kept in EEPROM
    - Boot guard: the first start after an update is supervised by the
      watchdog until the application calls pjon_boot_app_ok()
+   - Serial upload compatible with Optiboot (STK500v1, as used by the
+     Arduino IDE and avrdude -c arduino) on USART0, if SERIAL_UPLOAD
 
    Not supported: shared mode, MAC, extended length, broadcast, routing,
    receiving while a page is being written (the sender's ping is retried by
@@ -85,8 +87,19 @@
 #ifndef EXTRF_TIMEOUT_MS  // Stay in the bootloader after the reset pin, 0=off
   #define EXTRF_TIMEOUT_MS 1000
 #endif
-#ifndef BOOT_START        // Byte address of the bootloader section
-  #define BOOT_START 0x7800
+#ifndef BOOT_START        // Start of the bootloader, flash above is protected
+  #define BOOT_START 0x7400
+#endif
+
+/* Split layout (BOOT_SIZE=3072 in the Makefile): the hardware boot section
+   is 2kB (0x7800-0x7FFF) and holds main() and the flash writing code (SPM
+   only works from the boot section); functions marked LOWTEXT are placed in
+   the 1kB below it (0x7400-0x77FF). The application can not write flash
+   itself, and the bootloader refuses writes from BOOT_START up. */
+#if LOW_SECTION
+  #define LOWTEXT __attribute__((noinline, section(".bootlow")))
+#else
+  #define LOWTEXT
 #endif
 #ifndef BOOT_GUARD_S      // Seconds the app has to call pjon_boot_app_ok()
   #define BOOT_GUARD_S    8  // 0 (off), 1, 2, 4 or 8
@@ -102,6 +115,16 @@
   #define BOOT_GUARD_WDTO WDTO_8S
 #elif BOOT_GUARD_S != 0
   #error "BOOT_GUARD_S must be 0, 1, 2, 4 or 8"
+#endif
+
+#ifndef SERIAL_UPLOAD     // Optiboot compatible serial upload on USART0
+  #define SERIAL_UPLOAD   1
+#endif
+#ifndef SERIAL_BAUD
+  #define SERIAL_BAUD 115200
+#endif
+#if SERIAL_UPLOAD && (PJON_PIN <= 1)
+  #error "Pins 0 and 1 are the serial port: use another PJON_PIN or SERIAL_UPLOAD=0"
 #endif
 
 /* Announcements: first one within ~1s, then every 5s doubling up to 60s,
@@ -209,6 +232,7 @@ static uint8_t device_id NOINIT;
 static uint8_t serial[4] NOINIT;              // copy of the EEPROM serial
 static uint16_t random_state NOINIT;          // random8() state
 static uint8_t flashed NOINIT;                // a page was written
+static uint32_t frame_crc NOINIT;             // CRC32 of the received frame
 
 #define NO_PAGE 0xFFFF
 
@@ -227,7 +251,7 @@ static uint32_t crc32_update(uint32_t crc, uint8_t b) {
 }
 
 /* Meta-data CRC8 of the packets sent by the bootloader (PJON CRC8 C2) */
-static uint8_t crc8(const uint8_t *data, uint8_t length) {
+LOWTEXT static uint8_t crc8(const uint8_t *data, uint8_t length) {
   uint8_t crc = 0;
   while(length--) {
     uint8_t b = *data++;
@@ -285,8 +309,8 @@ static uint8_t read_byte(void) {
 
 /* Receives a frame (3 sync pads then sync pad + byte for each byte).
    Called when the bus is high. Returns the packet length or 0, and in
-   *crc the CRC32 of the packet without its last 4 bytes (the CRC32). */
-static uint8_t receive_frame(uint32_t *crc) {
+   frame_crc the CRC32 of the packet without its last 4 bytes (the CRC32). */
+LOWTEXT static uint8_t receive_frame(void) {
   uint8_t length = BUFFER_LENGTH, i;
   uint32_t c = 0xFFFFFFFF;
   if(!sync() || !sync() || !sync()) return 0;
@@ -306,7 +330,7 @@ static uint8_t receive_frame(uint32_t *crc) {
       length = b;
     }
   }
-  *crc = ~c;
+  frame_crc = ~c;
   return length;
 }
 
@@ -406,7 +430,7 @@ static uint8_t announce(uint8_t reason) {
    serial is generated from the jitter between the watchdog oscillator and
    the CPU clock, and saved. The first byte of a serial is never 0xFF. */
 #define EEPROM_SERIAL ((uint8_t *)PJON_BOOT_EEPROM_SERIAL_ADDR)
-static void load_serial(void) {
+LOWTEXT static void load_serial(void) {
   if(eeprom_read_byte(EEPROM_SERIAL) == 0xFF) {
     uint32_t mix = 0;
     TCCR1B = (1 << CS10); // F_CPU
@@ -495,6 +519,130 @@ static uint8_t app_present(void) {
 }
 
 #define EEPROM_FLAG ((uint8_t *)PJON_BOOT_EEPROM_FLAG_ADDR)
+static void start_app(void);
+
+/* Serial upload (STK500v1 subset, like Optiboot) ------------------------- */
+
+#if SERIAL_UPLOAD
+#define STK_OK          0x10
+#define STK_FAILED      0x11
+#define STK_INSYNC      0x14
+#define CRC_EOP         0x20
+#define STK_GET_SYNC    '0'
+#define STK_GET_PARAM   'A'
+#define STK_SET_DEVICE  'B'
+#define STK_SET_DEV_EXT 'E'
+#define STK_LEAVE       'Q'
+#define STK_LOAD_ADDR   'U'
+#define STK_UNIVERSAL   'V'
+#define STK_PROG_PAGE   'd'
+#define STK_READ_PAGE   't'
+#define STK_READ_SIGN   'u'
+#define STK_SW_MAJOR    0x81
+#define STK_SW_MINOR    0x82
+
+static void serial_init(void) {
+  PORTD |= 1; // pull-up on RX: no noise when nothing is connected
+  UCSR0A = (1 << U2X0);
+  UBRR0 = (F_CPU + 4UL * SERIAL_BAUD) / (8UL * SERIAL_BAUD) - 1;
+  UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+  UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+static void putch(uint8_t c) {
+  while(!(UCSR0A & (1 << UDRE0)));
+  UDR0 = c;
+}
+
+/* The watchdog (1s) is reset by each received byte: if the upload stops the
+   device is reset, like with Optiboot */
+static uint8_t getch(void) {
+  while(!(UCSR0A & (1 << RXC0)));
+  wdt_reset();
+  return UDR0;
+}
+
+static void skip(uint8_t count) {
+  while(count--) getch();
+}
+
+/* Every command ends with CRC_EOP. Out of sync: reset (Optiboot does the
+   same), the host retries the synchronization. */
+static void insync(void) {
+  if(getch() != CRC_EOP) {
+    wdt_enable(WDTO_15MS);
+    for(;;);
+  }
+  putch(STK_INSYNC);
+}
+
+/* Serves an STK500v1 session started by the byte c. Does not return: it
+   ends starting the application (STK_LEAVE) or with a watchdog reset. */
+LOWTEXT static void serial_session(uint8_t c) __attribute__((noreturn));
+static void serial_session(uint8_t c) {
+  uint16_t address = 0;
+  uint8_t written = 0;
+  wdt_enable(WDTO_1S);
+  for(;; c = getch()) {
+    uint8_t ok = 1;
+    if(c == STK_GET_PARAM) {
+      uint8_t which = getch();
+      insync();
+      putch(which == STK_SW_MAJOR ? 8 : 3); // version 8.3, like Optiboot
+    } else if(c == STK_SET_DEVICE) {
+      skip(20);
+      insync();
+    } else if(c == STK_SET_DEV_EXT) {
+      skip(5);
+      insync();
+    } else if(c == STK_LOAD_ADDR) {
+      address = getch();
+      address |= getch() << 8;
+      address <<= 1; // word address
+      insync();
+    } else if(c == STK_UNIVERSAL) {
+      skip(4);
+      insync();
+      putch(0);
+    } else if(c == STK_PROG_PAGE) {
+      getch(); // length high byte, always 0
+      uint8_t length = getch(), type = getch();
+      for(uint8_t i = 0; i < length; i++) {
+        uint8_t b = getch();
+        if(i < SPM_PAGESIZE) page[i] = b;
+      }
+      insync();
+      /* Flash only, full pages; the bootloader can not be overwritten */
+      ok = (type == 'F') && (length == SPM_PAGESIZE) &&
+        write_page(address, page);
+      written |= ok;
+    } else if(c == STK_READ_PAGE) {
+      getch();
+      uint8_t length = getch(), type = getch();
+      insync();
+      while(length--) putch((type == 'F') ? pgm_read_byte(address++) : 0xFF);
+    } else if(c == STK_READ_SIGN) {
+      insync();
+      putch(SIGNATURE_0);
+      putch(SIGNATURE_1);
+      putch(SIGNATURE_2);
+    } else if(c == STK_LEAVE) {
+      insync();
+      putch(STK_OK);
+      while(!(UCSR0A & (1 << UDRE0)));
+      /* A serial upload does not use the boot guard (Arduino sketches do
+         not call pjon_boot_app_ok()) */
+      if(written) eeprom_update_byte(EEPROM_FLAG, 0xFF);
+      __builtin_avr_delay_cycles(CYCLES(200)); // last byte out
+      wdt_disable();
+      start_app();
+      wdt_enable(WDTO_15MS); // no application: restart the bootloader
+      for(;;);
+    } else insync(); // GET_SYNC, ENTER_PROGMODE and anything else
+    putch(ok ? STK_OK : STK_FAILED);
+  }
+}
+#endif
 
 static uint8_t app_pending(void) {
   return eeprom_read_byte(EEPROM_FLAG) == PJON_BOOT_FLAG_PENDING;
@@ -509,16 +657,27 @@ static void start_app(void) {
   TCNT1 = 0;
   TIFR1 = 0xFF;
   BUS_RELEASE();
+#if SERIAL_UPLOAD
+  UCSR0B = 0;
+  PORTD &= ~1;
+#endif
 #if BOOT_GUARD_S
   if(app_pending()) wdt_enable(BOOT_GUARD_WDTO);
 #endif
-  __asm__ __volatile__ ("jmp 0");
+  /* Reset flags also in r2, like Optiboot */
+  __asm__ __volatile__ (
+    "in r2, %0" "\n\t"
+    "jmp 0" :: "I" (_SFR_IO_ADDR(GPIOR0))
+  );
 }
 
 /* Main -------------------------------------------------------------------- */
 
 int main(void) __attribute__((OS_main, section(".init9")));
 
+/* main() must not need a stack frame: the compiler would reserve it with
+   pushes (rcall) before the mailbox at the top of SRAM is read, destroying
+   it. Do not take the address of local variables here. */
 int main(void) {
   __asm__ __volatile__ ("clr __zero_reg__");
   /* Read and clear the mailbox before anything is pushed on the stack */
@@ -543,6 +702,7 @@ int main(void) {
   if(watchdog && (magic_1 == PJON_BOOT_MAGIC_ENTER)) {
     if(id && (id < 254)) device_id = id;
     timeout = OVERFLOWS(TIMEOUT_MS);
+    reason = PJON_BOOT_REASON_REQUESTED; // tell the sender we are here
   }
 #if BOOT_GUARD_S
   else if((reset_flags & (1 << WDRF)) && app_pending())
@@ -557,11 +717,18 @@ int main(void) {
   TCCR1A = 0;
   load_serial();
   TCCR1B = (1 << CS11); // F_CPU / 8
+#if SERIAL_UPLOAD
+  serial_init();
+#endif
   uint16_t remaining = timeout;
   uint16_t interval = OVERFLOWS(ANNOUNCE_FIRST_MS);
   uint16_t next_announce = 1 + (random8() & 31);
 
   for(;;) {
+#if SERIAL_UPLOAD
+    if((UCSR0A & (1 << RXC0)) && (UDR0 == STK_GET_SYNC))
+      serial_session(STK_GET_SYNC);
+#endif
     if(TIFR1 & (1 << TOV1)) {
       TIFR1 = (1 << TOV1);
       if(timeout && !--remaining) {
@@ -587,9 +754,9 @@ int main(void) {
     }
     /* The meta-data CRC8 is not checked: the CRC32 covers the whole packet
        (meta-data and CRC8 included) and the length is already bounded */
-    uint32_t crc;
-    uint8_t length = receive_frame(&crc);
+    uint8_t length = receive_frame();
     if(!length) continue;
+    uint32_t crc = frame_crc;
     uint8_t i = length;
     while((i > length - 4) && (buffer[--i] == (uint8_t)crc)) crc >>= 8;
     if(i > length - 4) continue; // CRC32 is transmitted MSB first

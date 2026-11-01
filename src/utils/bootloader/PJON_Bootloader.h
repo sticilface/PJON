@@ -45,7 +45,11 @@
                                     (255 if unprovisioned) while the
                                     bootloader waits without timeout: no
                                     application in flash, or the application
-                                    did not confirm its start (boot guard).
+                                    did not confirm its start (boot guard);
+                                    also when entered on request ('B'), so
+                                    the sender can tell the bootloader from
+                                    the application (whose PJON acknowledges
+                                    bootloader commands too).
                                     Repeated every 5s, doubling up to 60s,
                                     with random jitter; postponed by any
                                     valid command.
@@ -123,6 +127,9 @@
 /* Announcement reasons */
 #define PJON_BOOT_REASON_NO_APP      1  // no application in flash
 #define PJON_BOOT_REASON_BOOT_FAILED 2  // application did not confirm
+#define PJON_BOOT_REASON_REQUESTED   3  // entered on request ('B'), sent so
+                                        // the sender knows the bootloader
+                                        // (not the application) answers
 
 /* Announcement payload: 'b' reason serial[4] version chunk_size */
 #define PJON_BOOT_ANNOUNCE_LENGTH  8

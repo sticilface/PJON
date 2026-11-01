@@ -46,7 +46,8 @@ CMD_GO = b"G"
 CMD_ASSIGN = b"I"
 CMD_ANNOUNCE = ord("b")
 UNASSIGNED = 255
-REASONS = {1: "no application", 2: "application did not start (boot guard)"}
+REASONS = {1: "no application", 2: "application did not start (boot guard)",
+           3: "entered on request"}
 
 
 def parse_hex(path):
@@ -80,7 +81,7 @@ def parse_hex(path):
     return data
 
 
-def build_pages(data, boot_start=0x7000):
+def build_pages(data, boot_start=0x7400):
     if not data:
         raise ValueError("the HEX file is empty")
     end = max(data) + 1
@@ -212,15 +213,19 @@ def main():
                         help="seconds to wait for an announcement (default 120, "
                              "with --listen: 0 = forever)")
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--boot-start", type=lambda v: int(v, 0), default=0x7000,
-                        help="bootloader start address (default 0x7000, 4kB "
-                             "boot section)")
+    parser.add_argument("--boot-start", type=lambda v: int(v, 0), default=0x7400,
+                        help="bootloader start address: 0x7400 for the default "
+                             "3kB layout, 0x7000 for BOOT_SIZE=4096")
     parser.add_argument("--chunk-size", type=int, default=32,
                         choices=[16, 32, 64, 128],
                         help="bytes per write packet, as CHUNK_SIZE of the "
                              "bootloader build (default 32)")
     parser.add_argument("--no-enter", action="store_true",
-                        help="do not ask the application to enter the bootloader")
+                        help="the device is already in the bootloader: do not "
+                             "ask the application to enter it")
+    parser.add_argument("--enter-wait", type=float, default=5,
+                        help="seconds to wait for the bootloader announcement "
+                             "after the request (default 5)")
     parser.add_argument("--ping-attempts", type=int, default=5)
     parser.add_argument("--write-attempts", type=int, default=3)
     parser.add_argument("--reply-timeout", type=float, default=10.0,
@@ -268,10 +273,14 @@ def main():
         args.no_enter = True
 
     if not args.no_enter:
-        if up.send(target, CMD_ENTER):
-            print("application restarted into the bootloader")
-        else:
+        if not up.send(target, CMD_ENTER):
             print("the application did not answer, trying the bootloader anyway")
+        # The application's PJON acknowledges bootloader commands too: wait
+        # for the bootloader's announcement to know it is really running
+        if not up.wait_announcement(args.enter_wait, lambda a: a.sender == target):
+            sys.exit("device %d did not announce the bootloader: is the "
+                     "application handling the bootloader request?" % target)
+        print("bootloader entered")
 
     for _ in range(args.ping_attempts):
         if up.send(target, CMD_PING):

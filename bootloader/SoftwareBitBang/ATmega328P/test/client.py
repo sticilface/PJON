@@ -27,7 +27,7 @@ spec = importlib.util.spec_from_file_location(
 up = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(up)
 
-BOOT_START = 0x7000
+BOOT_START = 0x7400
 EEPROM_ID_ADDR = 1019
 CHUNK = 32
 
@@ -80,8 +80,8 @@ def cmd_protect(port, device_id):
     device_id = int(device_id)
     uploader = connect(port)
     checks = [  # chunk address, expected acknowledgement
-        (0x6FE0, True),    # last chunk of the application area
-        (0x7000, False),   # first chunk of the bootloader
+        (0x73E0, True),    # last chunk of the application area
+        (0x7400, False),   # first chunk of the bootloader
         (0x7FE0, False),   # last chunk of the bootloader
         (0x0010, False),   # not aligned to a chunk
     ]

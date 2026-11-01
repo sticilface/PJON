@@ -1,9 +1,10 @@
 ## PJON SoftwareBitBang bootloader for ATmega328P
 
-A bootloader (about 2.4kB, in the 4kB boot section) that updates the firmware of an ATmega328P (ATmega328P-AU / TQFP, or DIP) over a single wire [SoftwareBitBang](/src/strategies/SoftwareBitBang/README.md) PJON bus. The bus pin and mode are chosen at build time.
+A 3kB bootloader that updates the firmware of an ATmega328P (ATmega328P-AU / TQFP, or DIP) over a single wire [SoftwareBitBang](/src/strategies/SoftwareBitBang/README.md) PJON bus, and also over the serial port like Optiboot (Arduino IDE upload, `avrdude -c arduino`). The bus pin and mode are chosen at build time.
 - **Updates:** the running application can restart the device into the bootloader with a PJON packet. If nothing arrives, the bootloader times out and starts the application again.
 - **Fresh install:** a new device, with no application and no device id, announces itself to the master. The master assigns it an id, saved in EEPROM, and flashes the application.
 - **Boot guard:** after an update, a new application that does not confirm its start within a few seconds is reset by the watchdog. The bootloader then stays active and announces the failure, so the master can flash a working application.
+- **Serial upload:** after a reset pin reset (the Arduino IDE resets the board through DTR) the bootloader also listens on the serial port for 1 second and accepts uploads with the Optiboot (STK500v1) protocol.
 
 Firmware is sent in small chunks (32 bytes by default), and every acknowledgement is immediate. So the sender can be a stock PJON device with default settings (`PJON_PACKET_MAX_LENGTH` 50, default `SWBB_RESPONSE_OFFSET`), including a PJON router.
 
@@ -18,20 +19,21 @@ Firmware is sent in small chunks (32 bytes by default), and every acknowledgemen
 - [Preparing the application](#preparing-the-application)
 - [Uploading firmware](#uploading-firmware)
 - [Fresh install (provisioning)](#fresh-install-provisioning)
+- [Serial upload (Arduino IDE, avrdude)](#serial-upload-arduino-ide-avrdude)
 - [Sending firmware from other PJON devices](#sending-firmware-from-other-pjon-devices)
 - [Simulation tests](#simulation-tests)
 - [Limitations](#limitations)
 
 ### Feasibility study
 
-**Question:** can a bootloader receive firmware over PJON SoftwareBitBang (SWBB) and flash an ATmega328P within the limits of the boot section? **Answer: yes.** The flashing part alone fits in 2kB (about 1350 bytes). With provisioning (announcements, id assignment, serial) and the boot guard it takes 2444–2448 bytes, so it uses the 4096 byte boot section (`BOOTSZ` = 2048 words) with about 1.6kB to spare.
+**Question:** can a bootloader receive firmware over PJON SoftwareBitBang (SWBB) and flash an ATmega328P within the limits of the boot section? **Answer: yes.** The flashing part alone fits in 2kB (about 1350 bytes). With provisioning (announcements, id assignment, serial number), the boot guard and Optiboot compatible serial upload it takes 2932–2936 bytes, laid out in 3kB (see below).
 
 #### Constraints of the ATmega328P
 
 | Resource | Limit | Used by this bootloader |
 | -------- | ----- | ----------------------- |
-| Boot section | 512, 1024, 2048 or 4096 bytes (`BOOTSZ` fuses) | 2444–2448 bytes (4096 byte section) |
-| Application space | 32768 − boot section | 28672 bytes (Optiboot leaves 32256) |
+| Boot section | 512, 1024, 2048 or 4096 bytes (`BOOTSZ` fuses) | 2kB boot section + 1kB below it: 2932–2936 bytes |
+| Application space | 32768 − bootloader | 29696 bytes (Optiboot leaves 32256) |
 | SRAM | 2048 bytes | 48 byte packet buffer, 128 byte page buffer, a few bytes of state and stack |
 | EEPROM | 1024 bytes | 6 bytes at the end: boot guard flag, device id, serial |
 | Flash page | 128 bytes, erase + write ≈ 9ms | assembled from 4 chunks of 32 bytes |
@@ -41,12 +43,20 @@ Sizes measured with avr-gcc 7.3.0 at 16MHz:
 
 | | pin 2 | pin 12 |
 | - | ----- | ------ |
-| mode 1 | 2448 | 2448 |
-| mode 2 | 2448 | 2448 |
-| mode 3 | 2444 | 2444 |
-| mode 4 | 2444 | 2444 |
+| mode 1 | 2936 | 2936 |
+| mode 2 | 2936 | 2936 |
+| mode 3 | 2932 | 2932 |
+| mode 4 | 2932 | 2932 |
 
-Without boot guard (`BOOT_GUARD_S=0`) it is about 100 bytes smaller. Sending its own packets (announcements with medium access and acknowledgement handling) and the id/serial handling are what push it past 2kB: even with the serial written at ISP time and the reset pin entry, page skipping and boot guard removed, it stays above 2048 bytes. An earlier version without chunks or provisioning fitted in 1kB (1000 bytes). The Makefile refuses builds that do not fit `BOOT_SIZE`.
+In mode 1 that is 1966 bytes in the boot section (of 2048) and 970 below it (of 1024). Without serial upload (`SERIAL_UPLOAD=0`) it is 2408 bytes.
+
+**3kB layout.** The ATmega328P boot section can only be 512, 1024, 2048 or 4096 bytes, so the default `BOOT_SIZE=3072` is a split layout:
+- **Boot section (0x7800–0x7FFF, 2kB):** selected by the fuses. It holds the reset entry (`main()`) and all the flash writing code, because the `SPM` instruction only works when executed from the boot section.
+- **Below it (0x7400–0x77FF, 1kB):** functions that do not write flash are placed here (`LOWTEXT` in the source: frame reception, CRC8, serial number, serial upload session).
+- **Protection:** the application can not write flash (it has no access to `SPM`), and the bootloader refuses writes from 0x7400 up.
+- **Checks:** the Makefile checks that each half fits, that `main()` is at the reset address, and that every `SPM` instruction is in the boot section.
+
+`BOOT_SIZE=4096` uses a normal 4kB boot section instead: more headroom (about 1.1kB free) and 1kB less for the application (28672 bytes). An earlier version without chunks, provisioning or serial upload fitted in 1kB (1000 bytes).
 
 #### Why not reuse the PJON library?
 
@@ -87,9 +97,9 @@ The `BOOTRST` fuse makes the bootloader run after every reset. At startup it rea
 
 | Reset cause | Behaviour | Device id |
 | ----------- | --------- | --------- |
-| Watchdog reset requested by the application (mailbox in SRAM) | stays active for `TIMEOUT_MS` (5s) | the id passed by the application |
+| Watchdog reset requested by the application (mailbox in SRAM) | stays active for `TIMEOUT_MS` (5s), **announces itself once** so the sender knows the bootloader (not the application) is answering | the id passed by the application |
 | Watchdog reset while the updated application is pending (boot guard) | stays active until a working application is written and started, **announces itself** | saved id |
-| Reset pin (`EXTRF`) | stays active for `EXTRF_TIMEOUT_MS` (1s), 0 disables it | saved id |
+| Reset pin (`EXTRF`) | stays active for `EXTRF_TIMEOUT_MS` (1s), 0 disables it; listens to PJON and to the serial port | saved id |
 | No application in flash | stays active until a valid application is written and started, **announces itself** | saved id |
 | Anything else (power on, brown out, plain watchdog reset) | starts the application immediately | |
 
@@ -119,7 +129,9 @@ The flag is in EEPROM because the application's stack overwrites the top of SRAM
 | Ping | `'P'` | bootloader | the last page was written and verified (or no page was written yet). Not answered while a page is being written |
 | Go | `'G'` | bootloader | the last page is correct; the application is then started (pending, with boot guard, if pages were written) |
 | Assign id | `'I'` serial (4 bytes) id | bootloader, usually at id 255 | the serial is the device's: the id (1–253) is saved in EEPROM and used from then on. Other unprovisioned devices ignore it, so several can wait on id 255 at once |
-| Announce | `'b'` reason serial (4 bytes) version chunk size | sent by the bootloader to the master (254) | — (the master's PJON acknowledges). Reason 1: no application, 2: application did not start |
+| Announce | `'b'` reason serial (4 bytes) version chunk size | sent by the bootloader to the master (254) | — (the master's PJON acknowledges). Reason 1: no application, 2: application did not start, 3: entered on request |
+
+**Why the announcement on request.** The application's PJON acknowledges every packet addressed to it, bootloader commands included, before the receiver function runs. An acknowledgement alone therefore does not prove that the bootloader is answering. After `'B'` the sender should wait for the announcement (reason 3) before flashing; `pjon_boot_upload.py` does, and stops with an error if the application did not enter the bootloader.
 
 Chunk rules:
 - The address is the byte address of the chunk, aligned to `CHUNK_SIZE` (32 by default; 16, 64 and 128 are also possible).
@@ -149,7 +161,9 @@ make PJON_PIN=12
 | `EXTRF_TIMEOUT_MS` | 1000 | time in the bootloader after a reset pin reset, 0 = never |
 | `F_CPU` | 16000000 | clock frequency |
 | `CHUNK_SIZE` | 32 | bytes of flash per write packet: 16, 32, 64 or 128, same as the sender |
-| `BOOT_SIZE` | 4096 | boot section size |
+| `BOOT_SIZE` | 3072 | flash used by the bootloader: 3072 (split layout, 2kB boot section) or 4096 |
+| `SERIAL_UPLOAD` | 1 | Optiboot compatible serial upload on pins 0/1 (the bus can not use them then) |
+| `SERIAL_BAUD` | 115200 | serial upload baud rate |
 | `EESAVE` | 1 | 1 keeps the EEPROM content when the chip is erased |
 | `BOOT_GUARD_S` | 8 | seconds an updated application has to call `pjon_boot_app_ok()`: 0 (off), 1, 2, 4 or 8 |
 | `EEPROM_ID_ADDR` | 1019 | EEPROM address of the device id; the guard flag is just before it and the 4 byte serial just after it, so 1018–1023 by default. Must match the application (`PJON_BOOT_EEPROM_ID_ADDR`) |
@@ -172,7 +186,7 @@ The second form uses an Arduino running the ArduinoISP sketch.
 - **Fallback:** if a chip is flashed without a serial, the bootloader generates a random one itself on its first start, from the jitter between the watchdog oscillator and the CPU clock.
 
 `make fuses` prints the fuse values. The defaults are:
-- high `0xD0`: 4kB boot section, `BOOTRST`, `SPIEN` and `EESAVE`. `EESAVE` keeps the EEPROM (device id, serial) through the chip erase done by `make flash`. With `EESAVE=0` the value is `0xD8`.
+- high `0xD2`: 2kB boot section (of the 3kB layout), `BOOTRST`, `SPIEN` and `EESAVE`. `EESAVE` keeps the EEPROM (device id, serial) through the chip erase done by `make flash`. With `EESAVE=0` the value is `0xDA`; with `BOOT_SIZE=4096` it is `0xD0`.
 - low `0xFF`: external crystal.
 - extended `0xFD`: brown-out at 2.7V.
 
@@ -235,7 +249,7 @@ void setup() {
 
 The example also answers `'Y'` (identify) on the bootloader port by blinking its LED quickly for 3 seconds.
 
-The application must be smaller than 28672 bytes. The Arduino IDE assumes the 512 byte Optiboot and allows 32256, but `pjon_boot_upload.py` refuses images that would overlap the bootloader. To get a HEX file, use *Sketch > Export compiled binary* in the Arduino IDE (take the file without `with_bootloader`), or `arduino-cli compile --output-dir`.
+The application must be smaller than 29696 bytes. The Arduino IDE assumes the 512 byte Optiboot and allows 32256, but `pjon_boot_upload.py` refuses images that would overlap the bootloader. To get a HEX file, use *Sketch > Export compiled binary* in the Arduino IDE (take the file without `with_bootloader`), or `arduino-cli compile --output-dir`.
 
 If an application without the hook was flashed, the device can still be recovered: pressing reset opens the bootloader for `EXTRF_TIMEOUT_MS` using the saved id. Use `--no-enter` and start the upload just before pressing reset; the uploader retries for several seconds.
 
@@ -256,7 +270,7 @@ written 33 pages in 4.7s
 application started
 ```
 
-Use `--no-enter` when the device is already in the bootloader (recovery, failed boot). Use `--chunk-size` if the bootloader was built with another `CHUNK_SIZE`, and `--boot-start` if it was built with another `BOOT_SIZE` (default `0x7000`, 4kB).
+After `'B'` the tool waits for the bootloader's announcement, so it never "flashes" an application that did not enter the bootloader. Use `--no-enter` when the device is already in the bootloader (recovery, failed boot): the tool then trusts the ping, which a running application would also acknowledge. Use `--chunk-size` if the bootloader was built with another `CHUNK_SIZE`, and `--boot-start` if it was built with another `BOOT_SIZE` (default `0x7400`, `0x7000` for 4096).
 
 ### Fresh install (provisioning)
 
@@ -287,6 +301,21 @@ For a failed boot, flash a working application with `--id 44 --no-enter`.
 
 A server (e.g. an ESP32 behind a router) does the same: on an announcement from id 255 it picks a free id, sends `'I'` serial id to id 255, then flashes the application on the new id. On an announcement with reason 2 from a known id, it flashes that device again.
 
+### Serial upload (Arduino IDE, avrdude)
+
+With `SERIAL_UPLOAD=1` (default) the bootloader speaks the Optiboot protocol (STK500v1) on the serial port (pins 0/1, 115200 baud):
+- **Entering:** after a reset pin reset it listens on the serial port during `EXTRF_TIMEOUT_MS` (1s). The Arduino IDE and `avrdude -c arduino` reset the board through DTR before uploading, so the board needs the usual auto-reset circuit (DTR → 100nF → RESET), or press reset just before uploading. It also listens whenever it waits on PJON (no application, failed boot, request).
+- **Commands:** signature, page write, read back for verification, start. Pages are written and verified like PJON uploads, and writes to the bootloader are refused, so a sketch that is too large fails cleanly.
+- **Not supported:** EEPROM is not written over serial.
+- **Boot guard:** serial uploads do not arm it, since Arduino sketches normally do not call `pjon_boot_app_ok()`. A pending mark left by a PJON update is cleared.
+- **Reset cause:** like Optiboot, the reset flags are passed to the application in register r2 (also in `GPIOR0`).
+
+```bash
+avrdude -c arduino -p m328p -P /dev/ttyUSB0 -b 115200 -D -U flash:w:firmware.hex:i
+```
+
+In the Arduino IDE, choose a board using Optiboot at 115200 baud (e.g. Arduino Uno), but note that the IDE assumes 32256 bytes are available while this bootloader leaves 29696. To get a warning in the IDE, add a board to `boards.txt` (or a `boards.local.txt`) copying the Uno with `upload.maximum_size=29696`. Do not use *Burn Bootloader* in the IDE: it would replace this bootloader with Optiboot.
+
 ### Sending firmware from other PJON devices
 
 Any PJON device (or router) can flash a node by following the protocol above. Requirements for the sender:
@@ -300,7 +329,7 @@ With the default chunk size the longest packet is 48 bytes, sender info and pack
 ### Simulation tests
 
 [`test/run_tests.sh`](test/run_tests.sh) runs end to end tests with simulated ATmega328P ([simavr](https://github.com/buserror/simavr)) sharing one bus wire:
-- one or two targets run the bootloader and the example application, built with the real PJON library;
+- one or two targets run the bootloader and the example application, built with the real PJON library; the first target's serial port can be exposed as a pty for avrdude;
 - the uploader runs the Uploader sketch, with the real PJON library;
 - `pjon_boot_upload.py` talks to the simulated uploader through a pty, exactly as it would with a real Arduino.
 
@@ -321,13 +350,15 @@ pip install pyserial
 | `pins` | pins 2 (PD2) and 17 (A3/PC3) |
 | `modes` | SoftwareBitBang modes 2, 3 and 4 |
 | `8mhz` | bootloader built for and running at 8MHz |
-| `large_image` | 28672 byte image filling the whole application area |
+| `large_image` | 29696 byte image filling the whole application area |
 | `protection` | chunks in the bootloader section and unaligned chunks are refused |
 | `router` | mode 3, pin 2, sender with `PJON_PACKET_MAX_LENGTH` 50, packet id, port, sender info and the default `SWBB_RESPONSE_OFFSET` |
 | `chunks` | a page with a missing chunk, swapped chunks or without its first chunk fails; a repeated chunk is accepted |
 | `provision` | a fresh device (erased EEPROM, serial generated by the bootloader) announces itself, gets id 45 and app v1; app v1 uses id 45 and is updated to app v2 through the hook |
 | `provision_two` | two fresh devices on the bus at once: an `'I'` with a wrong serial is refused, they get ids 45 and 46 and are flashed one after the other |
 | `boot_guard` | an update with an application that never confirms its start: reset by the watchdog after 8s, the bootloader announces the failure, a working application is flashed and runs without further resets |
+| `serial_fresh` | fresh chip: app v1 uploaded over the serial port with avrdude (Optiboot protocol, written and verified), then updated to app v2 over PJON through the hook |
+| `serial_reset` | app v1 running, reset pin (as the Arduino IDE does with DTR), avrdude uploads an application that never calls `pjon_boot_app_ok()`: it keeps running, serial uploads do not arm the boot guard |
 
 All tests pass. The simulator reports no bus contention while the target runs the bootloader; the few events it reports in some runs happen while the application (stock PJON library) exchanges the enter request with the uploader. Simulation covers the logic and the timing against the real PJON code. It does not cover the electrical side (cable length, pull-down value, noise) or clock deviations of real oscillators, so test on the real board before deploying.
 

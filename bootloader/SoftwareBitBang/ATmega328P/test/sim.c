@@ -27,8 +27,15 @@
      -t seconds  maximum simulated time (default 60), exit with failure
      -f file     dump the application flash of target 0 on exit
      -E prefix   dump the EEPROM of each target on exit in prefix<n>.bin
+     -R address  reset address (BOOTRST, start of the hardware boot section),
+                 default: start of the bootloader HEX file. 0x7800 for the
+                 split 3kB layout
+     -S          expose the USART0 of target 0 as a pty too
+                 (/tmp/simavr-target0), for serial uploads with avrdude
+     -X          targets start as after a reset pin reset (EXTRF) instead
+                 of a power on reset
      -e          trace bus edges (microseconds, who drives) on stderr
-     -n          do not create the pty (uploader serial unused) */
+     -n          do not create the uploader pty (uploader serial unused) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +45,7 @@
 #include <simavr/sim_avr.h>
 #include <simavr/sim_hex.h>
 #include <simavr/avr_eeprom.h>
+#include <simavr/avr_uart.h>
 #include <simavr/parts/uart_pty.h>
 
 #define MCU "atmega328p"
@@ -59,20 +67,26 @@ typedef struct {
 static target_t targets[MAX_TARGETS];
 static int target_count = 1;
 static avr_t *uploader;
-static uart_pty_t pty;
+static uart_pty_t pty, target_pty;
 static int pin_reg, ddr_reg, port_reg, mask;
-static uint32_t boot_start;
+static uint32_t boot_start, reset_address;
 
-/* Loads an Intel HEX file in flash, returns its start address */
+/* Loads an Intel HEX file (all its chunks) in flash, returns its lowest
+   address */
 static uint32_t load(avr_t *avr, const char *path, int verbose) {
-  uint32_t size = 0, start = 0;
-  uint8_t *data = read_ihex_file(path, &size, &start);
-  if(!data) {
+  ihex_chunk_p chunks = NULL;
+  int count = read_ihex_chunks(path, &chunks);
+  if(count <= 0) {
     fprintf(stderr, "sim: can not read %s\n", path);
     exit(2);
   }
-  memcpy(avr->flash + start, data, size);
-  free(data);
+  uint32_t start = 0xFFFFFFFF, size = 0;
+  for(int i = 0; i < count; i++) {
+    memcpy(avr->flash + chunks[i].baseaddr, chunks[i].data, chunks[i].size);
+    if(chunks[i].baseaddr < start) start = chunks[i].baseaddr;
+    size += chunks[i].size;
+  }
+  free_ihex_chunks(chunks);
   if(verbose)
     printf("sim: loaded %s at 0x%04X (%u bytes)\n", path, start, size);
   return start;
@@ -114,10 +128,12 @@ int main(int argc, char **argv) {
   const char *eeprom_dump = NULL, *serials[MAX_TARGETS] = {0};
   int ids[MAX_TARGETS] = {0}, serial_count = 0, id_count = 0;
   int bus_pin = 12, marker = -1, use_pty = 1, trace = 0, opt;
+  int target_serial = 0, reset_flags = 1;
+  long reset_option = -1;
   int id_address = 1019;
   double max_seconds = 60, marker_after = 0;
   uint32_t target_frequency = 16000000;
-  while((opt = getopt(argc, argv, "b:a:u:N:s:i:A:B:F:m:w:t:f:E:en")) != -1) {
+  while((opt = getopt(argc, argv, "b:a:u:N:s:i:A:B:F:m:w:t:f:E:R:SXen")) != -1) {
     switch(opt) {
       case 'b': boot = optarg; break;
       case 'a': app = optarg; break;
@@ -133,6 +149,9 @@ int main(int argc, char **argv) {
       case 't': max_seconds = atof(optarg); break;
       case 'f': dump = optarg; break;
       case 'E': eeprom_dump = optarg; break;
+      case 'R': reset_option = strtol(optarg, NULL, 0); break;
+      case 'S': target_serial = 1; break;
+      case 'X': reset_flags = 2; break; // EXTRF
       case 'e': trace = 1; break;
       case 'n': use_pty = 0; break;
       default: return 2;
@@ -158,13 +177,20 @@ int main(int argc, char **argv) {
     avr_init(t->avr);
     t->avr->frequency = target_frequency;
     t->avr->log = LOG_WARNING;
+    /* simavr sleeps (in real time) when the firmware polls an empty UART,
+       which the bootloader does in its main loop: disable it */
+    uint32_t uart_flags = 0;
+    avr_ioctl(t->avr, AVR_IOCTL_UART_GET_FLAGS('0'), &uart_flags);
+    uart_flags &= ~AVR_UART_FLAG_POLL_SLEEP;
+    avr_ioctl(t->avr, AVR_IOCTL_UART_SET_FLAGS('0'), &uart_flags);
     boot_start = load(t->avr, boot, !n);
+    reset_address = (reset_option >= 0) ? (uint32_t)reset_option : boot_start;
     if(app) load(t->avr, app, !n);
     /* BOOTRST fuse: reset vector in the bootloader section */
-    t->avr->reset_pc = boot_start;
-    t->avr->pc = boot_start;
-    t->avr->data[MCUSR_ADDR] = 1; // power on reset flag
-    t->last_pc = boot_start;
+    t->avr->reset_pc = reset_address;
+    t->avr->pc = reset_address;
+    t->avr->data[MCUSR_ADDR] = reset_flags; // PORF or EXTRF
+    t->last_pc = reset_address;
     t->in_boot = 1;
     uint8_t *ee = eeprom(t->avr);
     memset(ee, 0xFF, EEPROM_SIZE);
@@ -183,6 +209,15 @@ int main(int argc, char **argv) {
   uploader->log = LOG_WARNING;
   load(uploader, up, 1);
 
+  if(target_serial) {
+    /* uart_pty always names its link /tmp/simavr-uart<n>: rename it before
+       the uploader's pty takes that name */
+    uart_pty_init(targets[0].avr, &target_pty);
+    uart_pty_connect(&target_pty, '0');
+    unlink("/tmp/simavr-target0");
+    if(rename("/tmp/simavr-uart0", "/tmp/simavr-target0"))
+      perror("sim: target pty");
+  }
   if(use_pty) {
     uart_pty_init(uploader, &pty);
     uart_pty_connect(&pty, '0');
@@ -191,7 +226,7 @@ int main(int argc, char **argv) {
   int last_level = 0, contention_boot = 0, contention_app = 0;
   int result = 1, contention_now = 0;
   printf("sim: %d target(s) start in the bootloader at 0x%04X\n",
-    target_count, boot_start);
+    target_count, reset_address);
 
   for(;;) {
     /* Run the core that is behind in time */
@@ -213,7 +248,7 @@ int main(int argc, char **argv) {
       int n = current - targets;
       uint32_t pc = avr->pc;
       /* A reset is the only way into the bootloader entry point */
-      if(pc == boot_start && current->last_pc != boot_start) {
+      if(pc == reset_address && current->last_pc != reset_address) {
         uint8_t *ram = avr->data + RAMEND - 2;
         printf("sim: %.3fs target reset, MCUSR=0x%02X%s\n",
           us(avr) / 1e6, avr->data[MCUSR_ADDR], tag(n));

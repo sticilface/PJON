@@ -23,6 +23,10 @@ EXAMPLES=$HERE/../../../../examples/ARDUINO/Local/SoftwareBitBang/Bootloader
 BUILD=$HERE/build
 UPLOAD="python3 $BL_DIR/tools/pjon_boot_upload.py"
 PTY=/tmp/simavr-uart0
+TARGET_PTY=/tmp/simavr-target0
+# Reset vector of the default 3kB layout (2kB hardware boot section)
+RESET_ADDRESS=0x7800
+AVRDUDE="avrdude -q -q -c arduino -p m328p -b 115200 -P $TARGET_PTY"
 ID=44
 mkdir -p "$BUILD"
 
@@ -67,7 +71,7 @@ start_sim() {
   shift 2
   rm -f "$PTY"
   "$BUILD/sim" -b "$BUILD/$name-bootloader.hex" -u "$BUILD/$name-uploader.hex" \
-    -B "$pin" "$@" > "$BUILD/sim.log" 2>&1 &
+    -R $RESET_ADDRESS -B "$pin" "$@" > "$BUILD/sim.log" 2>&1 &
   SIM_PID=$!
   for _ in $(seq 100); do [ -e "$PTY" ] && return; sleep 0.1; done
   echo "simulator did not start"; cat "$BUILD/sim.log"; exit 1
@@ -194,7 +198,7 @@ test_8mhz() {
 }
 
 test_large_image() {
-  echo "large_image: application area filled up to the bootloader (28kB)"
+  echo "large_image: application area filled up to the bootloader (29kB)"
   build m1 12 1 16000000
   python3 client.py large "$BUILD/m1-app_v2.hex" "$BUILD/m1-large.hex" \
     | sed 's/^/    /'
@@ -308,11 +312,53 @@ test_boot_guard() {
   result $?
 }
 
+test_serial_fresh() {
+  echo "serial_fresh: fresh chip, app v1 uploaded over serial with avrdude"
+  echo "  (Optiboot protocol, written and verified), then updated to app v2"
+  echo "  over PJON through the hook"
+  build m1 12 1 16000000
+  start_sim m1 12 -S -m 2 -t 120 -f "$BUILD/flash.bin"
+  $AVRDUDE -U flash:w:"$BUILD/m1-app_v1.hex":i 2>&1 \
+    | grep -v "TIOCMGET" | sed 's/^/    /'
+  local serial=${PIPESTATUS[0]}
+  echo "    avrdude exit code: $serial"
+  $UPLOAD --port "$PTY" --id $ID --reply-timeout 60 "$BUILD/m1-app_v2.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  python3 client.py check "$BUILD/m1-app_v2.hex" "$BUILD/flash.bin" | sed 's/^/    /'
+  local flash=${PIPESTATUS[0]}
+  [ $serial -eq 0 ] && [ $up -eq 0 ] && [ $sim -eq 0 ] && [ $flash -eq 0 ]
+  result $?
+}
+
+test_serial_reset() {
+  echo "serial_reset: app v1 running, reset pin (as the Arduino IDE does with"
+  echo "  DTR), serial upload of an app that never calls pjon_boot_app_ok():"
+  echo "  serial uploads do not arm the boot guard, it keeps running"
+  build sr 12 1 16000000 "" "DEVICE_ID=$ID EXTRF_TIMEOUT_MS=4000"
+  start_sim sr 12 -a "$BUILD/sr-app_v1.hex" -S -X -m 0xFE -t 25
+  $AVRDUDE -D -U flash:w:"$BUILD/sr-app_noguard.hex":i 2>&1 \
+    | grep -v "TIOCMGET" | sed 's/^/    /'
+  local serial=${PIPESTATUS[0]}
+  echo "    avrdude exit code: $serial"
+  wait_sim
+  local after
+  after=$(awk '/GPIOR1 = 0x03/ {t=$2; resets=0} /target reset/ {resets++}
+    /^sim: simulated/ {gsub("s","",t); gsub("s,","",$3); print ($3 - t) " " resets}' \
+    "$BUILD/sim.log")
+  echo "    uploaded app ran ${after% *}s, resets: ${after#* }"
+  [ $serial -eq 0 ] && \
+    awk -v a="$after" 'BEGIN { split(a, v, " "); exit !(v[1] >= 10 && v[2] == 0) }'
+  result $?
+}
+
 gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/sim" sim.c \
   -lsimavrparts -lsimavr -lelf -lpthread -lutil || exit 1
 
 TESTS=${*:-hook_upload timeout fresh_chip interrupted pins modes 8mhz \
-  large_image protection router chunks provision provision_two boot_guard}
+  large_image protection router chunks provision provision_two boot_guard \
+  serial_fresh serial_reset}
 for t in $TESTS; do "test_$t"; done
 echo "passed: $PASSED, failed: $FAILED"
 [ $FAILED -eq 0 ]
