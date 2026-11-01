@@ -1,5 +1,9 @@
 ## SoftwareBitBang: interrupt driven receiver (prototype) on the ATmega328P
 
+> **Superseded by `SWBB_INTERRUPT_WAKE`** (see `REVIEW-swbb-interrupt-wake.md`):
+> it receives as reliably, supports modes 1-6, tolerates longer interrupt
+> handlers (25-40us instead of 5-10us), needs no Timer1 and less flash.
+
 Question: can SoftwareBitBang receive with interrupts instead of polling, and
 does that make it faster? Prototype:
 [`SoftwareBitBangIRQ.h`](src/strategies/SoftwareBitBang/SoftwareBitBangIRQ.h),
