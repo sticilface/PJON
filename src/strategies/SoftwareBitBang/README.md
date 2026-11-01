@@ -106,6 +106,17 @@ On the ATmega88/168/328 (Arduino Uno, Nano, Pro Mini) the pin can be selected at
 - Interrupts are disabled while a byte is transmitted or received (~0.3ms in mode 3, ~0.5ms in mode 1) and served during the padding bits, the time spent in interrupts is measured with Timer0 and compensated, so an interrupt can not distort a byte. Define `SWBB_ATOMIC 0` to keep interrupts enabled.
 - Timer0 must run as configured by the Arduino core (`millis`), it is read and never modified.
 
+#### Interrupt triggered reception (prototype, pins 2 and 3)
+With `SWBB_PIN 2` (INT0) or `3` (INT1), defining `SWBB_INTERRUPT_WAKE` makes the rising edge of an incoming frame trigger an interrupt that receives the whole frame with the same cycle exact code, checks it and transmits the acknowledgement at once. Frames are queued (`SWBB_WAKE_FRAMES`, default 2) and served by `bus.receive()`, that can be called whenever the application has time: frames are not missed while the application is busy. Modes 1-6, Timer1 is not used.
+```cpp
+#define SWBB_PIN 2
+#define SWBB_INTERRUPT_WAKE
+#include <PJONSoftwareBitBang.h>
+```
+- While a frame addressed to this device is received the application does not run (interrupts are served between bytes); a frame addressed to another device costs ~0.6ms in mode 3 plus ~5us for each of its rising edges.
+- The acknowledgement is sent by the interrupt only for frames addressed to this device id (the one passed to `begin`) in local mode: not for shared mode, not in router mode (acknowledging other device ids).
+- See [REVIEW-swbb-interrupt-wake.md](/REVIEW-swbb-interrupt-wake.md) for the measurements.
+
 ### Why not interrupts?
 In the Arduino environment the use of libraries is really extensive and often the end user is not able to go over collisions. Very often a library is using hardware resources of the microcontroller, colliding with other libraries. This happens because in general Arduino boards have limited hardware resources. Software-defined bit-banging, is a stable and reliable solution that leads to "more predictable" results than interrupt driven procedures coexisting on limited microcontrollers without the developer and the end user knowing about it.
 

@@ -112,6 +112,17 @@
   #define SoftwareBitBang SoftwareBitBangPolling
 #endif
 
+/* Interrupt triggered reception (prototype, see SoftwareBitBangWake.h) */
+#ifdef SWBB_INTERRUPT_WAKE
+  #ifndef SWBB_PIN
+    #error "SWBB_INTERRUPT_WAKE requires SWBB_PIN"
+  #endif
+  #ifdef SWBB_INTERRUPT
+    #error "Define either SWBB_INTERRUPT or SWBB_INTERRUPT_WAKE"
+  #endif
+  #define SoftwareBitBang SoftwareBitBangPolling
+#endif
+
 class SoftwareBitBang {
   public:
     /* Returns the delay related to the attempts passed as parameter: */
@@ -872,4 +883,9 @@ class SoftwareBitBang {
 #ifdef SWBB_INTERRUPT
   #undef SoftwareBitBang
   #include "SoftwareBitBangIRQ.h"
+#endif
+
+#ifdef SWBB_INTERRUPT_WAKE
+  #undef SoftwareBitBang
+  #include "SoftwareBitBangWake.h"
 #endif

@@ -6,6 +6,7 @@ Two simulated ATmega328P at 16MHz ([simavr](https://github.com/buserror/simavr))
 - `P`: this library, portable implementation (`digitalRead`, `digitalWrite`, `pinMode`)
 - `F`: this library with `SWBB_PIN` (direct port access)
 - `I` / `IA`: `SWBB_PIN` with `SWBB_INTERRUPT` (interrupt driven reception, see [REVIEW-swbb-interrupt.md](/REVIEW-swbb-interrupt.md)), `IA` with `SWBB_INTERRUPT_ACK`
+- `W`: `SWBB_PIN` with `SWBB_INTERRUPT_WAKE` (interrupt triggered reception, see [REVIEW-swbb-interrupt-wake.md](/REVIEW-swbb-interrupt-wake.md))
 
 Requirements: `apt install gcc-avr avr-libc binutils-avr libsimavr-dev libelf-dev`
 
@@ -20,6 +21,8 @@ Requirements: `apt install gcc-avr avr-libc binutils-avr libsimavr-dev libelf-de
 | `./size_irq.sh` | Flash, RAM and idle polling cost of `F`, `I`, `IA`. |
 | `python3 ack_latency.py <trace>` | Acknowledgement latency from a `SIM_FLAGS=-e` trace. |
 | `python3 isr_time.py <trace>` | Interrupt time of B from a trace, B built with `-DSWBB_IRQ_PIN_DEBUG` (PD3 high in the interrupts). |
+| `./wake_eval.sh <section>` | Interrupt triggered receiver `W`: `matrix` (every implementation to and from `W`, modes 1-6), `busy`, `gap` (busy receiver, packets every `GAP_MS`), `load` (`ISR` us), `foreign` (packets to another device interleaved), `cpu` (interrupt time, uses `wake_isr.py`), `millis`, `pair <A> <B> [mode]`. |
+| `./size_wake.sh` | Flash and RAM of `F`, `IA`, `W`. |
 | `./bench.sh [modes]` | CPU time taken polling an idle bus, duration of `can_start()`, and how often `can_start()` wrongly reports the bus free while another device is waiting for a response (keep busy bits). |
 
 The simulator (`swbb_sim.c`) drives the bus pin through the simavr port IRQ, so pin change and external interrupts work, traces PD3 of B (`-e`) and reports bus contention: one device driving the bus high while the other drives it low.

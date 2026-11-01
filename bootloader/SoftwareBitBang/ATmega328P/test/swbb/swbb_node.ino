@@ -25,6 +25,7 @@
 PJONSoftwareBitBang bus(MY_ID);
 static uint16_t received = 0, bad = 0;
 static uint8_t seen[32];
+static uint32_t work = 0; // BUSY_US units of application work done
 
 static void print_number(uint32_t n) {
   char b[11];
@@ -78,9 +79,17 @@ void loop() {
   if(n == 0 && millis() < 10) return; // let the receiver start
   if(n < COUNT) {
     for(uint16_t i = 0; i < LENGTH; i++) payload[i] = (uint8_t)(n + i * 7);
+    #ifdef FOREIGN
+      /* Before each packet a packet to device 77 (not present): its frame
+         and the keep busy bits that follow are traffic to ignore */
+      bus.send_packet(77, payload, LENGTH);
+    #endif
     if(bus.send_packet(PEER, payload, LENGTH) == PJON_ACK) ok++;
     else fail++;
     n++;
+    #ifdef TX_GAP_MS
+      delay(TX_GAP_MS); // Time between packets
+    #endif
     if(n == COUNT) {
       elapsed = micros() - start;
       Serial.print("DONE ok "); print_number(ok);
@@ -94,6 +103,7 @@ void loop() {
   #ifdef BUSY_US
     /* The application is busy for BUSY_US between two bus.receive() calls */
     bus.receive();
+    work++;
     for(uint32_t w = BUSY_US; w; ) {
       uint16_t d = (w > 10000) ? 10000 : w;
       delayMicroseconds(d);
@@ -116,6 +126,19 @@ void loop() {
         if(!(seen[i >> 3] & (1 << (i & 7)))) {
           Serial.print(" "); print_number(i); shown++;
         }
+    #endif
+    #ifdef BUSY_US
+      Serial.print(" work "); print_number(work);
+      Serial.print(" ms "); print_number(millis());
+    #endif
+    #ifdef SWBB_INTERRUPT_WAKE
+      Serial.print(" wakes "); print_number(swbb_wake::wakes);
+      Serial.print(" stored "); print_number(swbb_wake::stored);
+      Serial.print(" foreign "); print_number(swbb_wake::foreign);
+      Serial.print(" dropped "); print_number(swbb_wake::dropped);
+      Serial.print(" failed "); print_number(swbb_wake::failed_first);
+      Serial.print("/"); print_number(swbb_wake::failed_init);
+      Serial.print("/"); print_number(swbb_wake::failed_byte);
     #endif
     Serial.println("");
   }
