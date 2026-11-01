@@ -104,6 +104,11 @@
   #ifndef SWBB_PIN
     #error "SWBB_INTERRUPT requires SWBB_PIN"
   #endif
+  #if SWBB_MODE > 4
+    /* Bits of 8-12us are shorter than the jitter of the edge timestamps
+       (the interrupt waits for any other one being served, e.g. Timer0) */
+    #error "SWBB_INTERRUPT supports modes 1-4 only"
+  #endif
   #define SoftwareBitBang SoftwareBitBangPolling
 #endif
 
