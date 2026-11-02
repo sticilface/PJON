@@ -86,4 +86,19 @@ pin 3 and an ATmega328P uploader on pin 2:
 | `mega_provision` | a fresh device gets id 45 and app v1, then is updated to app v2 through the hook |
 | `mega_serial` | `avrdude -c wiring` writes and verifies a 136kB image (above 128kB), then app v2 over PJON |
 
-RESULTS_PLACEHOLDER
+Full suite (31 ATmega328P tests + 14 ATmega2560 runs, the 13 tests above with
+`mega_hook_upload` run in modes 1 and 3): 45/45 passed with the portable
+uploader, and 45/45 with `DIRECT_IO=1` (`SWBB_PIN` uploader).
+
+Bootloader link: 200 write chunks, one attempt each, ATmega328P sender on
+pin 2, ATmega2560 bootloader on pin 3. The bus uses the cable model (1.5nF,
+100 ohm series, 100k pull-down).
+
+| Mode | Sender | 16MHz | 8MHz bootloader |
+|---|---|---|---|
+| 1 | portable / `SWBB_PIN` | 200/200 / 200/200 | |
+| 3 | portable / `SWBB_PIN` | 200/200 / 200/200 | 200/200 (`SWBB_PIN`) |
+| 6 | `SWBB_PIN` | 200/200 | 200/200 |
+| 7 | `SWBB_PIN` | 200/200 | 200/200 |
+
+There was no bus contention in any run.
