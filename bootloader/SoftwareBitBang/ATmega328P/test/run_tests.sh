@@ -218,6 +218,28 @@ test_fast_modes() {
   result $?
 }
 
+test_mode7() {
+  echo "mode_7: full update using mode 7 (not PJDL, SWBB_PIN, pin 2)"
+  build m7 2 7 16000000 "-DSWBB_PIN=2"
+  upload_test m7 2
+  result $?
+  echo "mode_7_wake: full update using mode 7, application and uploader with"
+  echo "  SWBB_INTERRUPT_WAKE"
+  build m7w 2 7 16000000 "-DSWBB_PIN=2 -DSWBB_INTERRUPT_WAKE"
+  upload_test m7w 2
+  result $?
+  echo "mode_7_8mhz: mode 7, bootloader at 8MHz, fresh chip upload"
+  build f8m7 2 7 8000000 "-DSWBB_PIN=2"
+  start_sim f8m7 2 -F 8000000 -m 2 -t 120
+  $UPLOAD --port "$PTY" --id $ID --no-enter --reply-timeout 60 \
+    "$BUILD/f8m7-app_v2.hex" | tr '\r' '\n' | grep -v '^writing' \
+    | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  [ $up -eq 0 ] && [ $sim -eq 0 ]
+  result $?
+}
+
 test_large_image() {
   echo "large_image: application area filled up to the bootloader (30kB)"
   build m1 12 1 16000000
@@ -263,7 +285,7 @@ gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/sim" sim.c \
   -lsimavrparts -lsimavr -lelf -lpthread -lutil || exit 1
 
 TESTS=${*:-hook_upload timeout fresh_chip interrupted pins modes 8mhz \
-  large_image protection router chunks fast_modes}
+  large_image protection router chunks fast_modes mode7}
 for t in $TESTS; do "test_$t"; done
 echo "passed: $PASSED, failed: $FAILED"
 [ $FAILED -eq 0 ]

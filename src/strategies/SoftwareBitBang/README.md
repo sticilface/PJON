@@ -49,6 +49,15 @@ It is suggested to add 8kΩ-5MΩ pull-down resistor as shown in the graph above 
 
 Modes 5 and 6 are not part of PJDL v5.0: they need the [direct port access](#direct-port-access-atmega88168328) implementation on every device of the bus (and the bootloader built with the same `MODE`). They were validated only in simulation, which does not model the cable: test them on the real bus before using them, see [REVIEW-swbb-fast-modes.md](/REVIEW-swbb-fast-modes.md).
 
+#### Mode 7 (prototype, not PJDL)
+`SWBB_MODE 7` uses a different wire format (UART like bytes: start bit, 8 data bits, stop bit at 4us per bit, after a 96us preamble, frames received and transmitted as a whole) with the same PJON packets and API. Every device of the bus must use mode 7 with `SWBB_PIN` (optionally `SWBB_INTERRUPT_WAKE`), and the bootloader built with `MODE=7`. In simulation it carries about 1.7-1.8 times the payload of mode 6 (7.2kB/s for 20 bytes payloads with acknowledgement, 10.1kB/s for 50 bytes). It also has a contention slot that lets one of two devices starting at the same time win without disturbing the other. Clock difference between devices: up to about +-3.5%. Use [Mode7LinkTest](/examples/ARDUINO/Local/SoftwareBitBang/Mode7LinkTest/Mode7LinkTest.ino) on the real bus first, see [REVIEW-swbb-mode7.md](/REVIEW-swbb-mode7.md).
+```cpp
+#define SWBB_MODE 7
+#define SWBB_PIN  2
+// #define SWBB_INTERRUPT_WAKE // to receive in the INT0 interrupt
+#include <PJONSoftwareBitBang.h>
+```
+
 When including and using the `SoftwareBitBang` strategy you have the complete access to the microcontroller. This happens because `SoftwareBitBang` runs a completely software-defined implementation, transforming a painful walk in a nice flight.
 
 Communication over a single wire enables quick and creative experimentation. The first suggested test, at the tester's risk, is to let two Arduino boards communicate [through a living body](https://www.youtube.com/watch?v=caMit7nzJsM) touching with the left hand the digital pin of the first board and with the right the pin of the other one (should be harmless). It is stunning to see it working perfectly through the human body, although it also works through water and other conductors.

@@ -24,6 +24,12 @@ Requirements: `apt install gcc-avr avr-libc binutils-avr libsimavr-dev libelf-de
 | `./wake_eval.sh <section>` | Interrupt triggered receiver `W`: `matrix` (every implementation to and from `W`, modes 1-6), `busy`, `gap` (busy receiver, packets every `GAP_MS`), `load` (`ISR` us), `foreign` (packets to another device interleaved), `cpu` (interrupt time, uses `wake_isr.py`), `millis`, `pair <A> <B> [mode]`. |
 | `./size_wake.sh` | Flash and RAM of `F`, `IA`, `W`. |
 | `./rc_eval.sh [matrix\|fast\|boot]` | Tests on the analog bus model (`swbb_sim -C <pF> -R <ohm> -P <ohm>`): `CAP` (default 1500pF), series 100 ohm, `PULL` (default 100k). |
+| `./m7_eval.sh <tx> <rx> [flags]` | Mode 7 link test (`F` polling, `W` wake receiver; `3`, `6` for comparison) on the analog bus model. `CAP`, `PULL`, `BFREQ` (clock of the receiver, for clock error tests), `M7` (flags for both). |
+| `./m7_sweep.sh "<bit us>" "<clock %>"` | Mode 7 receiver clock tolerance for each bit time. |
+| `./m7_speed.sh` | Throughput with acknowledgement (back to back packets) of modes 3, 6 and 7, payloads of 5, 20, 50 bytes. |
+| `./m7_load.sh`, `./m7_gap.sh` | Mode 7 under interrupt load (handler every 256us on both devices), interrupt window length. |
+| `./m7_collide.sh` | Both devices transmitting to each other at the same time (modes 3, 6, 7, 7 wake). |
+| `./m7_boot.sh` | Mode 7 uploader to bootloader link (200 chunks), bootloader at 16/8MHz. |
 | `./bench.sh [modes]` | CPU time taken polling an idle bus, duration of `can_start()`, and how often `can_start()` wrongly reports the bus free while another device is waiting for a response (keep busy bits). |
 
 The simulator (`swbb_sim.c`) drives the bus pin through the simavr port IRQ, so pin change and external interrupts work, traces PD3 of B (`-e`) and reports bus contention: one device driving the bus high while the other drives it low.

@@ -7,6 +7,7 @@
 #ifndef SWBB_INITIAL_DELAY
   #define SWBB_INITIAL_DELAY 1
 #endif
+#define SWBB_M7_STATS // Mode 7 statistics, printed with DONE
 #include <PJONSoftwareBitBang.h>
 
 #ifndef BUS_PIN
@@ -95,10 +96,24 @@ void loop() {
       Serial.print("DONE ok "); print_number(ok);
       Serial.print(" fail "); print_number(fail);
       Serial.print(" us "); print_number(elapsed);
+      #if SWBB_MODE == 7
+        Serial.print(" window_ticks "); print_number(swbb_m7::max_ticks);
+        Serial.print(" overruns "); print_number(swbb_m7::overruns);
+        Serial.print(" gave_up "); print_number(swbb_m7::collisions);
+        #ifdef SWBB_M7_WINDOW_STATS
+          Serial.print(" ticks");
+          for(uint8_t i = 0; i < 16; i++) {
+            Serial.print(" "); print_number(swbb_m7::window_hist[i]);
+          }
+        #endif
+      #endif
       Serial.println("");
     }
   }
-  bus.receive(200);
+  #ifndef TX_RECEIVE_US // Receive time between packets (0: back to back)
+    #define TX_RECEIVE_US 200
+  #endif
+  bus.receive(TX_RECEIVE_US);
 #else
   #ifdef BUSY_US
     /* The application is busy for BUSY_US between two bus.receive() calls */
@@ -131,7 +146,19 @@ void loop() {
       Serial.print(" work "); print_number(work);
       Serial.print(" ms "); print_number(millis());
     #endif
-    #ifdef SWBB_INTERRUPT_WAKE
+    #if SWBB_MODE == 7
+      Serial.print(" m7fail "); print_number(swbb_m7::fail_long);
+      Serial.print("/"); print_number(swbb_m7::fail_short);
+      Serial.print("/"); print_number(swbb_m7::fail_start);
+      Serial.print("/"); print_number(swbb_m7::fail_stop);
+      Serial.print("/"); print_number(swbb_m7::fail_late);
+    #endif
+    #if defined(SWBB_INTERRUPT_WAKE) && (SWBB_MODE == 7)
+      Serial.print(" wakes "); print_number(swbb_m7::wakes);
+      Serial.print(" stored "); print_number(swbb_m7::stored);
+      Serial.print(" dropped "); print_number(swbb_m7::dropped);
+      Serial.print(" failed "); print_number(swbb_m7::failed);
+    #elif defined(SWBB_INTERRUPT_WAKE)
       Serial.print(" wakes "); print_number(swbb_wake::wakes);
       Serial.print(" stored "); print_number(swbb_wake::stored);
       Serial.print(" foreign "); print_number(swbb_wake::foreign);

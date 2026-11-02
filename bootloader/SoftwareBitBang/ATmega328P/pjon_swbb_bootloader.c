@@ -145,8 +145,14 @@
   #define PAD_DEFAULT_US  MODE6_PAD_US
   #define BIT_DEFAULT_US  MODE6_BIT_US
   #define ACC_DEFAULT_US  MODE6_ACC_US
+#elif MODE == 7
+  /* Mode 7 is not PJDL (see src/strategies/SoftwareBitBang/
+     SoftwareBitBangM7.h): these values are not used */
+  #define PAD_DEFAULT_US  50
+  #define BIT_DEFAULT_US   8
+  #define ACC_DEFAULT_US  12
 #else
-  #error "MODE must be 1, 2, 3, 4, 5 or 6"
+  #error "MODE must be 1, 2, 3, 4, 5, 6 or 7"
 #endif
 #ifndef PAD_US
   #define PAD_US PAD_DEFAULT_US
@@ -238,7 +244,9 @@ static uint8_t page[SPM_PAGESIZE] NOINIT;     // page being assembled
 static uint16_t page_address NOINIT;          // its address, NO_PAGE if none
 static uint8_t next_chunk NOINIT;             // chunks received in order
 static uint8_t last_page_ok NOINIT;           // result of the last page write
+#if MODE <= 6
 static uint16_t byte_end NOINIT;              // Timer1 at the end of a byte
+#endif
 static uint8_t device_id NOINIT;
 
 #define NO_PAGE 0xFFFF
@@ -268,6 +276,7 @@ static uint32_t crc32_update(uint32_t crc, uint8_t b) {
   return crc;
 }
 
+#if MODE <= 6
 /* SoftwareBitBang reception ----------------------------------------------- */
 
 /* Synchronization pad: a high padding bit followed by a low data bit.
@@ -406,6 +415,182 @@ static void send_ack(void) {
   );
   BUS_RELEASE();
 }
+
+#else
+/* Mode 7 (not PJDL) ------------------------------------------------------
+
+   Same timing as src/strategies/SoftwareBitBang/SoftwareBitBangM7.h, the
+   values must match the library's (SWBB_M7_*): a frame is a preamble (high,
+   possibly extended by the transmitter's contention slot), a low bit and
+   bytes made of a start bit (high), 8 data bits LSB first and a stop bit
+   (low); after every M7_WINDOW bytes the transmitter keeps the bus low for
+   its interrupt window. The CRC32 is computed after the frame, the
+   transmitter keeps the bus busy meanwhile. */
+
+#ifndef M7_BIT_US
+  #define M7_BIT_US         4
+#endif
+#ifndef M7_PREAMBLE_US
+  #define M7_PREAMBLE_US    (24 * M7_BIT_US)
+#endif
+#ifndef M7_PREAMBLE_MIN_US
+  #define M7_PREAMBLE_MIN_US (11 * M7_BIT_US)
+#endif
+#ifndef M7_SLOTS_US                   // SWBB_M7_SLOTS * SWBB_M7_SLOT_STEP
+  #define M7_SLOTS_US       32
+#endif
+#ifndef M7_WINDOW
+  #define M7_WINDOW         4
+#endif
+#ifndef M7_GAP_MAX_US                 // SWBB_M7_GAP + 64
+  #define M7_GAP_MAX_US     (48 + 64)
+#endif
+#ifndef M7_KEEP_BUSY_US
+  #define M7_KEEP_BUSY_US   3
+#endif
+#ifndef M7_RESPONSE_DELAY_US
+  #define M7_RESPONSE_DELAY_US 6
+#endif
+#ifndef M7_PULSE_WAIT_US
+  #define M7_PULSE_WAIT_US  40
+#endif
+#ifndef M7_ACK_HIGH_US
+  #define M7_ACK_HIGH_US    (4 * M7_BIT_US)
+#endif
+#ifndef M7_ADVANCE                    // cycles, as SWBB_M7_ADVANCE
+  #define M7_ADVANCE        21
+#endif
+
+/* Edge waiting loops of exactly 6 cycles, return the iterations left */
+#define LOOPS(us) ((uint16_t)(CYCLES(us) / 6))
+
+static uint16_t wait_while_low(uint16_t loops) {
+  __asm__ __volatile__ (
+    "1: sbic %[in], %[bit]  \n\t"
+    "   rjmp 2f             \n\t"
+    "   sbiw %[n], 1        \n\t"
+    "   brne 1b             \n\t"
+    "2:                     \n\t"
+    : [n] "+w" (loops)
+    : [in] "I" (_SFR_IO_ADDR(BUS_IN)), [bit] "I" (BUS_BIT)
+  );
+  return loops;
+}
+
+static uint16_t wait_while_high(uint16_t loops) {
+  __asm__ __volatile__ (
+    "1: sbis %[in], %[bit]  \n\t"
+    "   rjmp 2f             \n\t"
+    "   sbiw %[n], 1        \n\t"
+    "   brne 1b             \n\t"
+    "2:                     \n\t"
+    : [n] "+w" (loops)
+    : [in] "I" (_SFR_IO_ADDR(BUS_IN)), [bit] "I" (BUS_BIT)
+  );
+  return loops;
+}
+
+/* Waits for a start bit and receives the byte: returns > 255 on error */
+static uint16_t rx_byte(uint16_t loops) {
+  if(!wait_while_low(loops)) return 0x100;
+  __builtin_avr_delay_cycles(CYCLES(M7_BIT_US * 1.5) - M7_ADVANCE);
+  uint8_t value = 0, i = 8;
+  uint16_t n;
+  __asm__ __volatile__ (
+    "1: lsr  %[v]                 \n\t"
+    "   sbic %[in], %[bit]        \n\t"
+    "   ori  %[v], 0x80           \n\t"
+    "   dec  %[i]                 \n\t"
+    "   breq 3f                   \n\t"
+    "   ldi  %A[n], lo8(%[loops]) \n\t"
+    "   ldi  %B[n], hi8(%[loops]) \n\t"
+    "2: sbiw %[n], 1              \n\t"
+    "   brne 2b                   \n\t"
+    "   .rept %[nops]             \n\t"
+    "   nop                       \n\t"
+    "   .endr                     \n\t"
+    "   rjmp 1b                   \n\t"
+    "3:                           \n\t"
+    : [v] "+d" (value), [i] "+r" (i), [n] "=&w" (n)
+    : [in] "I" (_SFR_IO_ADDR(BUS_IN)), [bit] "I" (BUS_BIT),
+      [loops] "i" (BIT_LOOPS(M7_BIT_US, 8)),
+      [nops] "i" (BIT_NOPS(M7_BIT_US, 8))
+  );
+  __builtin_avr_delay_cycles(CYCLES(M7_BIT_US) - 4);
+  if(BUS_HIGH()) return 0x200; // stop bit
+  return value;
+}
+
+/* Receives a frame, called when the bus is high. Returns the packet length
+   or 0, and in *crc the CRC32 of the packet without its last 4 bytes. */
+static uint8_t receive_frame(uint32_t *crc) {
+  uint8_t length = BUFFER_LENGTH, i;
+  uint16_t max = LOOPS(M7_PREAMBLE_US + M7_SLOTS_US + 20);
+  uint16_t left = wait_while_high(max);
+  if(!left || ((uint16_t)(max - left) < LOOPS(M7_PREAMBLE_MIN_US))) return 0;
+  uint16_t wait = LOOPS(2 * M7_BIT_US);
+  for(i = 0; i < length; i++) {
+    uint16_t b = rx_byte(wait);
+    if(b > 255) return 0;
+    buffer[i] = b;
+    if(i == 0) {
+      if(b != device_id) return 0;
+    } else if(i == 1) {
+      if(b & (PJON_MODE_BIT | PJON_MAC_BIT | PJON_EXT_LEN_BIT)) return 0;
+      if((b & (PJON_CRC_BIT | PJON_PORT_BIT)) != (PJON_CRC_BIT | PJON_PORT_BIT))
+        return 0;
+    } else if(i == 2) {
+      if((b > BUFFER_LENGTH) || (b < MIN_LENGTH)) return 0;
+      length = b;
+    }
+    wait = ((i + 1) % M7_WINDOW) ?
+      LOOPS((2 * M7_BIT_US) + 2) : LOOPS(M7_BIT_US + M7_GAP_MAX_US + 8);
+  }
+  uint32_t c = 0xFFFFFFFF;
+  for(i = 0; i < length - 4; i++) c = crc32_update(c, buffer[i]);
+  *crc = ~c;
+  return length;
+}
+
+/* Acknowledgement: synchronize to a keep busy pulse, then a high pulse, a
+   low bit and the response byte (start, 8 bits, stop) */
+static void send_ack(void) {
+  uint16_t r = ((uint16_t)PJON_ACK << 1) | 1, n;
+  uint8_t i = 10;
+  wait_while_low(LOOPS(M7_PULSE_WAIT_US));
+  wait_while_high(LOOPS(M7_KEEP_BUSY_US + 6));
+  __builtin_avr_delay_cycles(CYCLES(M7_RESPONSE_DELAY_US));
+  BUS_SET();
+  BUS_DRIVE();
+  __builtin_avr_delay_cycles(CYCLES(M7_ACK_HIGH_US));
+  BUS_CLEAR();
+  __builtin_avr_delay_cycles(CYCLES(M7_BIT_US) - 8);
+  /* 12 cycles + 4 * BIT_LOOPS + BIT_NOPS = 1 bit */
+  __asm__ __volatile__ (
+    "1: sbrc %A[r], 0             \n\t"
+    "   sbi  %[port], %[bit]      \n\t"
+    "   sbrs %A[r], 0             \n\t"
+    "   cbi  %[port], %[bit]      \n\t"
+    "   lsr  %B[r]                \n\t"
+    "   ror  %A[r]                \n\t"
+    "   ldi  %A[n], lo8(%[loops]) \n\t"
+    "   ldi  %B[n], hi8(%[loops]) \n\t"
+    "2: sbiw %[n], 1              \n\t"
+    "   brne 2b                   \n\t"
+    "   .rept %[nops]             \n\t"
+    "   nop                       \n\t"
+    "   .endr                     \n\t"
+    "   dec  %[i]                 \n\t"
+    "   brne 1b                   \n\t"
+    : [r] "+r" (r), [i] "+r" (i), [n] "=&w" (n)
+    : [port] "I" (_SFR_IO_ADDR(BUS_PORT)), [bit] "I" (BUS_BIT),
+      [loops] "i" (BIT_LOOPS(M7_BIT_US, 12)),
+      [nops] "i" (BIT_NOPS(M7_BIT_US, 12))
+  );
+  BUS_RELEASE(); // after the stop bit the bus is already low
+}
+
+#endif
 
 /* Flash ------------------------------------------------------------------- */
 

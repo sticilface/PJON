@@ -99,6 +99,15 @@
   #define SWBB_BIT_NOPS(BIT, OVERHEAD) ((SWBB_CYCLES(BIT) - (OVERHEAD)) % 4)
 #endif
 
+/* Mode 7 (not PJDL, see SoftwareBitBangM7.h): the PJDL class below is
+   compiled as SoftwareBitBangPolling for its direct port access helpers */
+#if SWBB_MODE == 7
+  #ifdef SWBB_INTERRUPT
+    #error "SWBB_MODE 7 supports SWBB_INTERRUPT_WAKE, not SWBB_INTERRUPT"
+  #endif
+  #define SoftwareBitBang SoftwareBitBangPolling
+#endif
+
 /* Interrupt driven reception (prototype, see SoftwareBitBangIRQ.h) */
 #ifdef SWBB_INTERRUPT
   #ifndef SWBB_PIN
@@ -896,7 +905,10 @@ class SoftwareBitBang {
   #include "SoftwareBitBangIRQ.h"
 #endif
 
-#ifdef SWBB_INTERRUPT_WAKE
+#if SWBB_MODE == 7
+  #undef SoftwareBitBang
+  #include "SoftwareBitBangM7.h"
+#elif defined(SWBB_INTERRUPT_WAKE)
   #undef SoftwareBitBang
   #include "SoftwareBitBangWake.h"
 #endif

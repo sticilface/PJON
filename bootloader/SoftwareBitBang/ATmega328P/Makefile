@@ -7,7 +7,7 @@
 #   PJON_PIN          Arduino pin number of the PJON bus, 0-19 (A0=14)  [12]
 #   DEVICE_ID         Device id used when the application does not pass one,
 #                     e.g. after a reset pin reset or with no application [44]
-#   MODE              SoftwareBitBang mode 1-6 (must match the bus)       [1]
+#   MODE              SoftwareBitBang mode 1-7 (must match the bus)       [1]
 #                     5 and 6 are faster modes, the devices must use the
 #                     SoftwareBitBang direct port access (SWBB_PIN)
 #   TIMEOUT_MS        Time spent in the bootloader after the application

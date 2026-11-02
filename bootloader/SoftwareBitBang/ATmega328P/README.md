@@ -96,6 +96,10 @@ Modes 5 and 6 are not part of PJDL v5.0: they are supported only by this bootloa
 
 The range of the bus in modes 5 and 6 was not measured: the simulation does not model the cable (capacitance, reflections, noise). Test them on the real bus with an oscilloscope before using them.
 
+#### Mode 7 (not PJDL)
+
+`MODE=7` is the frame based link layer of `src/strategies/SoftwareBitBang/SoftwareBitBangM7.h` (UART like bytes of 10 bits of 4us, a 96us preamble, a contention slot, interrupt windows of the transmitter every 4 bytes, a short acknowledgement). The bootloader receives the whole frame, then checks the CRC32 while the transmitter keeps the bus busy. 1258 bytes, at 16MHz and 8MHz. Its timing values (`M7_*`) must match the library's (`SWBB_M7_*`). See [REVIEW-swbb-mode7.md](/REVIEW-swbb-mode7.md).
+
 #### Throughput
 
 Measured in simulation at 16MHz, mode 1: about 0.9kB/s. A full 30kB application flashes in about 33s, and a 4kB application in about 5s. Modes 3 and 4 are about 30% faster. Sending 200 chunks of 32 bytes (one attempt each, excluding the page write waits) takes 3.2s in mode 4, 1.76s in mode 5 and 1.41s in mode 6.
@@ -147,7 +151,7 @@ make PJON_PIN=12 DEVICE_ID=44
 | ------ | ------- | ----------- |
 | `PJON_PIN` | 12 | Arduino pin number of the bus, 0–19 (A0 = 14) |
 | `DEVICE_ID` | 44 | id used after a reset pin reset or with no application |
-| `MODE` | 1 | SoftwareBitBang mode 1–6, must match the bus (`SWBB_MODE`). Modes 5 and 6 are faster modes, every device of the bus must use the SoftwareBitBang direct port access (`SWBB_PIN`), see below |
+| `MODE` | 1 | SoftwareBitBang mode 1–7, must match the bus (`SWBB_MODE`). Modes 5 and 6 are faster modes, mode 7 is a different (not PJDL) link layer: every device of the bus must use the SoftwareBitBang direct port access (`SWBB_PIN`), see above |
 | `TIMEOUT_MS` | 5000 | time in the bootloader after the application requested it |
 | `EXTRF_TIMEOUT_MS` | 1000 | time in the bootloader after a reset pin reset, 0 = never |
 | `F_CPU` | 16000000 | clock frequency |
@@ -272,6 +276,7 @@ pip install pyserial
 | `pins` | pins 2 (PD2) and 17 (A3/PC3) |
 | `modes` | SoftwareBitBang modes 2, 3 and 4 |
 | `fast_modes` | modes 5 and 6 (uploader and application with `SWBB_PIN`), mode 5 with the bootloader at 8MHz |
+| `mode7` | mode 7 (uploader and application with `SWBB_PIN`, then with `SWBB_INTERRUPT_WAKE`), mode 7 with the bootloader at 8MHz |
 | `8mhz` | bootloader built for and running at 8MHz |
 | `large_image` | 30720 byte image filling the whole application area |
 | `protection` | chunks in the bootloader section and unaligned chunks are refused |

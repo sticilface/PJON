@@ -282,9 +282,9 @@
    were chosen in simulation, which does not model the cable (see
    REVIEW-swbb-fast-modes.md). */
 
-#if (SWBB_MODE == 5) || (SWBB_MODE == 6)
+#if (SWBB_MODE >= 5) && (SWBB_MODE <= 7)
   #ifndef SWBB_PIN
-    #error "SWBB_MODE 5 and 6 require SWBB_PIN (direct port access)"
+    #error "SWBB_MODE 5, 6 and 7 require SWBB_PIN (direct port access)"
   #endif
   #if SWBB_MODE == 5
     #ifndef SWBB_MODE5_PAD
@@ -407,7 +407,7 @@
   #define SWBB_WIRE_PAD_DEFAULT         65
   #define SWBB_WIRE_BIT_DEFAULT         26
   #define SWBB_WIRE_KEEP_BUSY_DEFAULT  6.5
-#elif (SWBB_MODE == 5) || (SWBB_MODE == 6)
+#elif (SWBB_MODE >= 5) && (SWBB_MODE <= 7)
   #define SWBB_WIRE_PAD_DEFAULT       SWBB_BIT_SPACER
   #define SWBB_WIRE_BIT_DEFAULT       SWBB_BIT_WIDTH
   #define SWBB_WIRE_KEEP_BUSY_DEFAULT    4
