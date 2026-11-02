@@ -85,15 +85,36 @@ namespace swbb_wake {
     uint8_t  acked;
   };
 
-  static Frame queue[SWBB_WAKE_FRAMES];
-  static volatile uint8_t head = 0, count = 0;
-  static uint8_t id = 0;
-  static uint8_t end = 0;          // Timer0 count at the end of a byte
-  static uint32_t last_rise = 0;   // micros() of the last rising edge
+  /* State shared by the interrupt and the strategy. In a project of several
+     source files that include PJON, define SWBB_WAKE_SHARED for all of them
+     and SWBB_WAKE_IMPLEMENTATION in exactly one (before any include): only
+     that one defines the state and the interrupt handler, the others see the
+     same state. Without SWBB_WAKE_SHARED (one source file, e.g. a sketch)
+     every file gets its own copy, as before. */
+#if defined(SWBB_WAKE_SHARED) && !defined(SWBB_WAKE_IMPLEMENTATION)
+  extern Frame queue[SWBB_WAKE_FRAMES];
+  extern volatile uint8_t head, count;
+  extern uint8_t id;
+  extern uint8_t end;
+  extern uint32_t last_rise;
+  extern volatile uint16_t wakes, stored, foreign, dropped;
+  extern volatile uint16_t failed_first, failed_init, failed_byte;
+#else
+  #ifdef SWBB_WAKE_SHARED
+    #define SWBB_WAKE_STORAGE
+  #else
+    #define SWBB_WAKE_STORAGE static
+  #endif
+  SWBB_WAKE_STORAGE Frame queue[SWBB_WAKE_FRAMES];
+  SWBB_WAKE_STORAGE volatile uint8_t head = 0, count = 0;
+  SWBB_WAKE_STORAGE uint8_t id = 0;
+  SWBB_WAKE_STORAGE uint8_t end = 0;          // Timer0 count at the end of a byte
+  SWBB_WAKE_STORAGE uint32_t last_rise = 0;   // micros() of the last rising edge
 
   // Statistics
-  static volatile uint16_t wakes = 0, stored = 0, foreign = 0, dropped = 0;
-  static volatile uint16_t failed_first = 0, failed_init = 0, failed_byte = 0;
+  SWBB_WAKE_STORAGE volatile uint16_t wakes = 0, stored = 0, foreign = 0, dropped = 0;
+  SWBB_WAKE_STORAGE volatile uint16_t failed_first = 0, failed_init = 0, failed_byte = 0;
+#endif
 
   /* CRC32 (IEEE 802.3) with a 16 entries table (~6us per byte at 16MHz) */
   static const uint32_t crc32_table[16] PROGMEM = {
@@ -308,6 +329,7 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
     bool _acked = false;
 };
 
+#if !defined(SWBB_WAKE_SHARED) || defined(SWBB_WAKE_IMPLEMENTATION)
 ISR(SWBB_WAKE_VECT) {
   using namespace swbb_wake;
   #ifdef SWBB_IRQ_PIN_DEBUG // PD3 high while the interrupt runs
@@ -327,3 +349,4 @@ ISR(SWBB_WAKE_VECT) {
     PORTD &= ~8;
   #endif
 }
+#endif
