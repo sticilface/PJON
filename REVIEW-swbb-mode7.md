@@ -9,7 +9,8 @@ modes 1-6.
 Everything below was measured in simulation (two ATmega328P at 16MHz, simavr,
 cycle accurate) on the analog bus model of the real bus (1.5nF, 100 ohm series
 resistors, 100k pull-down, see `REVIEW-swbb-cable.md`) unless stated otherwise.
-Nothing was run on hardware. Tools: `bootloader/SoftwareBitBang/ATmega328P/
+Hardware results of the test plan below (steps 1-4 on a bench bus: 7.32 kB/s, 0 errors in 880,000 packets) are in
+[REVIEW-swbb-hardware.md](REVIEW-swbb-hardware.md#6-mode-7-8ba4996a-the-hardware-test-plan-of-review-swbb-mode7md). Tools: `bootloader/SoftwareBitBang/ATmega328P/
 test/swbb/m7_*.sh`.
 
 ### Design

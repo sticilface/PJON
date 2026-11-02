@@ -1,5 +1,7 @@
 ## SoftwareBitBang: bootloader timing and fast modes 5 and 6
 
+Hardware results for mode 6 (bench bus, two boards and a full system through a router): [REVIEW-swbb-hardware.md](REVIEW-swbb-hardware.md).
+
 Follow-up of [REVIEW-swbb-atmega328p.md](REVIEW-swbb-atmega328p.md), now that the
 bootloader may change too. Two changes:
 

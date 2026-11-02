@@ -173,4 +173,7 @@ which does not trigger external interrupts; it now raises the port pin IRQ
   after another frame) could be missed.
 - **Interrupt handlers longer than ~25us** (modes 3-6) break reception, as
   with polling (40us fails in mode 3 for both).
-- Pins 2 and 3 only (INT0/INT1). Simulation only, no hardware test.
+- Pins 2 and 3 only (INT0/INT1).
+- On hardware (bench, mode 6): the measurements above are confirmed or better, except 40us interrupt handlers
+  (0, not 83); the interrupt ACKs before PJON parses the frame, and its RAM and stack cost matter on a 328P. See
+  [REVIEW-swbb-hardware.md](REVIEW-swbb-hardware.md).
