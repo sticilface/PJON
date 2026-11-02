@@ -30,6 +30,10 @@ EXAMPLES=$HERE/../../../../examples/ARDUINO/Local/SoftwareBitBang/Bootloader
 BUILD=$HERE/build
 UPLOAD="python3 $BL_DIR/tools/pjon_boot_upload.py"
 PTY=/tmp/simavr-uart0
+TARGET_PTY=/tmp/simavr-target0
+# Reset vector of the default 3kB layout (2kB hardware boot section)
+RESET_ADDRESS=0x7800
+AVRDUDE="avrdude -q -q -c arduino -p m328p -b 115200 -P $TARGET_PTY"
 ID=44
 mkdir -p "$BUILD"
 
@@ -47,12 +51,14 @@ sketch() {
   avr-objcopy -O ihex -R .eeprom "$BUILD/$out.elf" "$BUILD/$out.hex"
 }
 
-# build <name> <bus pin> <mode> <F_CPU> [sketch flags]: bootloader, app v1,
-# app v2 and uploader. Sketch flags are added to the three PJON sketches.
+# build <name> <bus pin> <mode> <F_CPU> [sketch flags] [make options]:
+# bootloader, app v1, app v2, uploader and an app without boot guard
+# confirmation. Sketch flags are added to the PJON sketches, make options
+# to the bootloader build (default DEVICE_ID=44).
 build() {
-  local name=$1 pin=$2 mode=$3 fcpu=$4 extra=${5:-}
+  local name=$1 pin=$2 mode=$3 fcpu=$4 extra=${5:-} options=${6-DEVICE_ID=$ID}
   make -s -C "$BL_DIR" clean
-  make -s -C "$BL_DIR" PJON_PIN=$pin MODE=$mode F_CPU=$fcpu DEVICE_ID=$ID \
+  make -s -C "$BL_DIR" PJON_PIN=$pin MODE=$mode F_CPU=$fcpu $options \
     ${BL_SOURCE:+SOURCE=$BL_SOURCE} \
     || exit 1
   cp "$BL_DIR/pjon_swbb_bootloader.hex" "$BUILD/$name-bootloader.hex"
@@ -64,6 +70,7 @@ build() {
   sketch "$EXAMPLES/AppWithBootloaderHook/AppWithBootloaderHook.ino" \
     "$name-app_v2" $flags -DAPP_MARKER=2
   sketch "$EXAMPLES/Uploader/Uploader.ino" "$name-uploader" $flags
+  sketch "$HERE/app_noguard.cpp" "$name-app_noguard" -DAPP_MARKER=3
 }
 
 SIM_PID=
@@ -73,7 +80,7 @@ start_sim() {
   shift 2
   rm -f "$PTY"
   "$BUILD/sim" -b "$BUILD/$name-bootloader.hex" -u "$BUILD/$name-uploader.hex" \
-    -B "$pin" "$@" > "$BUILD/sim.log" 2>&1 &
+    -R $RESET_ADDRESS -B "$pin" "$@" > "$BUILD/sim.log" 2>&1 &
   SIM_PID=$!
   for _ in $(seq 100); do [ -e "$PTY" ] && return; sleep 0.1; done
   echo "simulator did not start"; cat "$BUILD/sim.log"; exit 1
@@ -199,6 +206,83 @@ test_8mhz() {
   result $?
 }
 
+# provision_flow <name> <pin> <mode> <F_CPU> <sketch flags>: a fresh device
+# announces itself, gets id 45 and app v1, then app v1 is updated to app v2
+# through the hook. With a bootloader at 8MHz only the first part (the test
+# applications are built for 16MHz, they can not use the bus at 8MHz).
+provision_flow() {
+  local name=$1 pin=$2 mode=$3 fcpu=$4 extra=$5 first=v2
+  [ $fcpu = 16000000 ] && first=v1
+  build $name $pin $mode $fcpu "$extra" ""
+  start_sim $name $pin -F $fcpu -m 2 -t 120 -E "$BUILD/$name-eeprom"
+  $UPLOAD --port "$PTY" --provision 45 --reply-timeout 60 \
+    "$BUILD/$name-app_$first.hex" | tr '\r' '\n' | grep -v '^writing' \
+    | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  if [ $fcpu = 16000000 ]; then
+    $UPLOAD --port "$PTY" --id 45 --reply-timeout 60 "$BUILD/$name-app_v2.hex" \
+      | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+    local up2=${PIPESTATUS[0]}
+    [ $up2 -eq 0 ] || up=1
+  fi
+  wait_sim; local sim=$?
+  python3 client.py eeprom "$BUILD/$name-eeprom0.bin" 45 | sed 's/^/    /'
+  local ee=${PIPESTATUS[0]}
+  [ $up -eq 0 ] && [ $sim -eq 0 ] && [ $ee -eq 0 ]
+}
+
+test_announce_modes() {
+  for mode in 3 6 7; do
+    echo "provision_mode_$mode: announcement, id assignment and updates in"
+    echo "  mode $mode (pin 2, SWBB_PIN)"
+    provision_flow pm$mode 2 $mode 16000000 "-DSWBB_PIN=2"
+    result $?
+  done
+  echo "provision_mode_7_8mhz: announcement, id assignment and upload with"
+  echo "  the bootloader at 8MHz (mode 7)"
+  provision_flow pm7f8 2 7 8000000 "-DSWBB_PIN=2"
+  result $?
+  echo "boot_guard_mode_7: application that never confirms its start, the"
+  echo "  bootloader announces the failure in mode 7, a working app is flashed"
+  build bg7 2 7 16000000 "-DSWBB_PIN=2"
+  start_sim bg7 2 -a "$BUILD/bg7-app_v1.hex" -i 44 -s 0A0B0C0D -m 0xFE -t 50 \
+    -E "$BUILD/bg7-eeprom"
+  $UPLOAD --port "$PTY" --id $ID --reply-timeout 60 "$BUILD/bg7-app_noguard.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up1=${PIPESTATUS[0]}
+  # the watchdog reset comes 8 simulated seconds after the update: wait in
+  # real time long enough even if the simulation runs slower than real time
+  timeout 90 $UPLOAD --port "$PTY" --listen --wait 40 --reply-timeout 60 \
+    > "$BUILD/listen.log"
+  sed 's/^/    /' "$BUILD/listen.log"
+  $UPLOAD --port "$PTY" --id $ID --no-enter --reply-timeout 60 \
+    "$BUILD/bg7-app_v2.hex" | tr '\r' '\n' | grep -v '^writing' \
+    | sed 's/^/    /'
+  local up2=${PIPESTATUS[0]}
+  wait_sim
+  local announced
+  announced=$(grep -c "id 44 serial 0a0b0c0d: application did not start" \
+    "$BUILD/listen.log")
+  [ "$announced" -ge 1 ] && [ $up1 -eq 0 ] && [ $up2 -eq 0 ]
+  result $?
+  echo "serial_mode_7: serial upload (Optiboot protocol) of app v1 with a"
+  echo "  mode 7 bootloader, then update to app v2 over PJON in mode 7"
+  build sm7 2 7 16000000 "-DSWBB_PIN=2"
+  start_sim sm7 2 -S -m 2 -t 120 -f "$BUILD/flash.bin"
+  $AVRDUDE -U flash:w:"$BUILD/sm7-app_v1.hex":i 2>&1 \
+    | grep -v "TIOCMGET" | sed 's/^/    /'
+  local serial=${PIPESTATUS[0]}
+  $UPLOAD --port "$PTY" --id $ID --reply-timeout 60 "$BUILD/sm7-app_v2.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  python3 client.py check "$BUILD/sm7-app_v2.hex" "$BUILD/flash.bin" \
+    | sed 's/^/    /'
+  local flash=${PIPESTATUS[0]}
+  [ $serial -eq 0 ] && [ $up -eq 0 ] && [ $sim -eq 0 ] && [ $flash -eq 0 ]
+  result $?
+}
+
 test_fast_modes() {
   for mode in 5 6; do
     echo "mode_$mode: full update using the fast mode $mode (SWBB_PIN, pin 2)"
@@ -241,7 +325,7 @@ test_mode7() {
 }
 
 test_large_image() {
-  echo "large_image: application area filled up to the bootloader (30kB)"
+  echo "large_image: application area filled up to the bootloader (29kB)"
   build m1 12 1 16000000
   python3 client.py large "$BUILD/m1-app_v2.hex" "$BUILD/m1-large.hex" \
     | sed 's/^/    /'
@@ -281,11 +365,127 @@ test_chunks() {
   result $?
 }
 
+test_provision() {
+  echo "provision: fresh device (erased EEPROM, serial generated by the"
+  echo "  bootloader) announces itself, gets id 45 and app v1, then app v1"
+  echo "  (using id 45 from EEPROM) is updated to app v2 through the hook"
+  build pv 12 1 16000000 "" ""
+  start_sim pv 12 -m 2 -t 120 -E "$BUILD/pv-eeprom"
+  $UPLOAD --port "$PTY" --provision 45 --reply-timeout 60 "$BUILD/pv-app_v1.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  $UPLOAD --port "$PTY" --id 45 --reply-timeout 60 "$BUILD/pv-app_v2.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up2=${PIPESTATUS[0]}
+  [ $up2 -eq 0 ] || up=1
+  wait_sim; local sim=$?
+  python3 client.py eeprom "$BUILD/pv-eeprom0.bin" 45 | sed 's/^/    /'
+  local ee=${PIPESTATUS[0]}
+  [ $up -eq 0 ] && [ $sim -eq 0 ] && [ $ee -eq 0 ]
+  result $?
+}
+
+test_provision_two() {
+  echo "provision_two: two fresh devices on the bus at once (serials written"
+  echo "  at ISP time), a wrong serial is refused, they get ids 45 and 46"
+  build pv 12 1 16000000 "" ""
+  start_sim pv 12 -N 2 -s 11111111 -s 22222222 -m 2 -t 300 \
+    -E "$BUILD/pv2-eeprom"
+  python3 client.py assign "$PTY" 33333333 45 0 | sed 's/^/    /'
+  local wrong=${PIPESTATUS[0]}
+  $UPLOAD --port "$PTY" --provision 45 --reply-timeout 60 "$BUILD/pv-app_v2.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up1=${PIPESTATUS[0]}
+  $UPLOAD --port "$PTY" --provision 46 --reply-timeout 60 "$BUILD/pv-app_v2.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up2=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  local ids
+  ids=$(for n in 0 1; do python3 client.py eeprom "$BUILD/pv2-eeprom$n.bin" 0 \
+    | sed 's/.*device id \([0-9]*\).*/\1/'; done | sort | tr '\n' ' ')
+  echo "    device ids in EEPROM: $ids"
+  [ $wrong -eq 0 ] && [ $up1 -eq 0 ] && [ $up2 -eq 0 ] && [ $sim -eq 0 ] && \
+    [ "$ids" = "45 46 " ]
+  result $?
+}
+
+test_boot_guard() {
+  echo "boot_guard: an update with an application that never confirms its"
+  echo "  start is reset by the watchdog, the bootloader stays and announces"
+  echo "  it, a working app is flashed and keeps running (no more resets)"
+  build m1 12 1 16000000
+  start_sim m1 12 -a "$BUILD/m1-app_v1.hex" -i 44 -s 0A0B0C0D -m 0xFE -t 50 \
+    -E "$BUILD/bg-eeprom"
+  $UPLOAD --port "$PTY" --id $ID --reply-timeout 60 "$BUILD/m1-app_noguard.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up1=${PIPESTATUS[0]}
+  timeout 60 $UPLOAD --port "$PTY" --listen --wait 15 --reply-timeout 60 \
+    > "$BUILD/listen.log"
+  sed 's/^/    /' "$BUILD/listen.log"
+  $UPLOAD --port "$PTY" --id $ID --no-enter --reply-timeout 60 \
+    "$BUILD/m1-app_v2.hex" | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up2=${PIPESTATUS[0]}
+  wait_sim
+  # the announcement, then app v2 running for at least 10s without reset
+  local announced after
+  announced=$(grep -c "id 44 serial 0a0b0c0d: application did not start" \
+    "$BUILD/listen.log")
+  after=$(awk '/GPIOR1 = 0x02/ {t=$2; resets=0} /target reset/ {resets++}
+    /^sim: simulated/ {gsub("s","",t); gsub("s,","",$3); print ($3 - t) " " resets}' \
+    "$BUILD/sim.log")
+  echo "    app v2 ran ${after% *}s, resets after it: ${after#* }"
+  [ "$announced" -ge 1 ] && [ $up1 -eq 0 ] && [ $up2 -eq 0 ] && \
+    awk -v a="$after" 'BEGIN { split(a, v, " "); exit !(v[1] >= 10 && v[2] == 0) }'
+  result $?
+}
+
+test_serial_fresh() {
+  echo "serial_fresh: fresh chip, app v1 uploaded over serial with avrdude"
+  echo "  (Optiboot protocol, written and verified), then updated to app v2"
+  echo "  over PJON through the hook"
+  build m1 12 1 16000000
+  start_sim m1 12 -S -m 2 -t 120 -f "$BUILD/flash.bin"
+  $AVRDUDE -U flash:w:"$BUILD/m1-app_v1.hex":i 2>&1 \
+    | grep -v "TIOCMGET" | sed 's/^/    /'
+  local serial=${PIPESTATUS[0]}
+  echo "    avrdude exit code: $serial"
+  $UPLOAD --port "$PTY" --id $ID --reply-timeout 60 "$BUILD/m1-app_v2.hex" \
+    | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  python3 client.py check "$BUILD/m1-app_v2.hex" "$BUILD/flash.bin" | sed 's/^/    /'
+  local flash=${PIPESTATUS[0]}
+  [ $serial -eq 0 ] && [ $up -eq 0 ] && [ $sim -eq 0 ] && [ $flash -eq 0 ]
+  result $?
+}
+
+test_serial_reset() {
+  echo "serial_reset: app v1 running, reset pin (as the Arduino IDE does with"
+  echo "  DTR), serial upload of an app that never calls pjon_boot_app_ok():"
+  echo "  serial uploads do not arm the boot guard, it keeps running"
+  build sr 12 1 16000000 "" "DEVICE_ID=$ID EXTRF_TIMEOUT_MS=4000"
+  start_sim sr 12 -a "$BUILD/sr-app_v1.hex" -S -X -m 0xFE -t 25
+  $AVRDUDE -D -U flash:w:"$BUILD/sr-app_noguard.hex":i 2>&1 \
+    | grep -v "TIOCMGET" | sed 's/^/    /'
+  local serial=${PIPESTATUS[0]}
+  echo "    avrdude exit code: $serial"
+  wait_sim
+  local after
+  after=$(awk '/GPIOR1 = 0x03/ {t=$2; resets=0} /target reset/ {resets++}
+    /^sim: simulated/ {gsub("s","",t); gsub("s,","",$3); print ($3 - t) " " resets}' \
+    "$BUILD/sim.log")
+  echo "    uploaded app ran ${after% *}s, resets: ${after#* }"
+  [ $serial -eq 0 ] && \
+    awk -v a="$after" 'BEGIN { split(a, v, " "); exit !(v[1] >= 10 && v[2] == 0) }'
+  result $?
+}
+
 gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/sim" sim.c \
   -lsimavrparts -lsimavr -lelf -lpthread -lutil || exit 1
 
 TESTS=${*:-hook_upload timeout fresh_chip interrupted pins modes 8mhz \
-  large_image protection router chunks fast_modes mode7}
+  large_image protection router chunks fast_modes mode7 provision \
+  provision_two boot_guard serial_fresh serial_reset announce_modes}
 for t in $TESTS; do "test_$t"; done
 echo "passed: $PASSED, failed: $FAILED"
 [ $FAILED -eq 0 ]

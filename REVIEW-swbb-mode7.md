@@ -128,8 +128,11 @@ released and read.
 uploader, 200 chunks of 32 bytes, one attempt each: 200/200 with the
 bootloader at 16MHz and 8MHz, from a polling and a wake uploader, at 1.5nF
 and 3nF. The 8MHz bootloader samples correctly only with `M7_ADVANCE` 19-24
-cycles (21 is used): the margin at 8MHz is small, 4us is the shortest bit for
-a bus with 8MHz bootloaders. Simulation suite (`run_tests.sh`): 20/20 with
+cycles (21 was used): the margin at 8MHz is small, 4us is the shortest bit for
+a bus with 8MHz bootloaders. Update (merge with the provisioning bootloader):
+the bootloader now checks the stop bit a quarter bit in and keeps the code
+between two bytes minimal, the window at 8MHz is 9-19 cycles (1-31 at 16MHz)
+and `M7_ADVANCE` is 14. Simulation suite (`run_tests.sh`): 20/20 with
 the portable uploader and 20/20 with `DIRECT_IO=1`, including the new `mode7`
 tests (full update with polling, with wake receivers, 8MHz bootloader).
 

@@ -25,10 +25,13 @@ if [ ! -x "$BUILD/swbb_sim" ] || [ swbb_sim.c -nt "$BUILD/swbb_sim" ]; then
 fi
 avr-gcc -mmcu=atmega328p -DF_CPU=${FCPU}UL -Os -std=gnu99 \
   -fno-split-wide-types -mrelax -I"$SRC" -DPJON_PIN=$BUS_PIN -DDEVICE_ID=44 \
-  -DMODE=$MODE -DBOOT_START=0x7800 ${BL_FLAGS:-} -nostartfiles \
-  -Wl,--section-start=.text=0x7800 -Wl,--relax -o "$BUILD/bl.elf" \
+  -DMODE=$MODE -DBOOT_START=0x7400 -DLOW_SECTION=1 ${BL_FLAGS:-} \
+  -nostartfiles -Wl,--section-start=.text=0x7800 \
+  -Wl,--section-start=.bootlow=0x7400 -Wl,--relax -o "$BUILD/bl.elf" \
   "$BL_SRC" || exit 2
-avr-objcopy -j .text -j .data -O ihex "$BUILD/bl.elf" "$BUILD/bl.hex"
+# the 3kB layout of the Makefile: main() at 0x7800, LOWTEXT at 0x7400
+avr-objcopy -j .text -j .data -j .bootlow -O ihex "$BUILD/bl.elf" \
+  "$BUILD/bl.hex"
 avr-g++ $FLAGS -mmcu=atmega328p -DF_CPU=16000000UL -Os -std=gnu++11 \
   -fno-exceptions -fno-rtti -fno-threadsafe-statics -ffunction-sections \
   -fdata-sections -Wl,--gc-sections -DARDUINO=10819 -I"$SHIM" -I"$SRC" \
