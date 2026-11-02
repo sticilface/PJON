@@ -606,13 +606,23 @@ class PJON {
       uint32_t attempts = 0;
       uint32_t start = PJON_MICROS();
       uint16_t old_length = length;
+      PJON_Packet_Info info = packet_info;
+      #if(PJON_INCLUDE_PACKET_ID)
+        // Melvan patch: fix the packet id once so every retry carries the SAME id. compose_packet()
+        // takes info by value and assigned a fresh id per attempt, so a retry after a lost ACK looked
+        // like a new packet and the receiver's known_packet_id() could not drop the duplicate.
+        if(
+          !info.id &&
+          (((info.header == PJON_NO_HEADER) ? config : info.header) & PJON_PACKET_ID_BIT)
+        ) info.id = PJONTools::new_packet_id(_packet_id_seed++);
+      #endif
 
       _recursion++;
       while(
         (state != PJON_ACK) && (attempts <= strategy.get_max_attempts()) &&
         (uint32_t)(PJON_MICROS() - start) <= timeout
       ) {
-        if(!(length = compose_packet(packet_info, data, payload, old_length))) {
+        if(!(length = compose_packet(info, data, payload, old_length))) {
           _recursion--;
           return PJON_FAIL;
         }
