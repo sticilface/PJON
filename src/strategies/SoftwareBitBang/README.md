@@ -125,6 +125,7 @@ With `SWBB_PIN 2` (INT0) or `3` (INT1), defining `SWBB_INTERRUPT_WAKE` makes the
 - While a frame addressed to this device is received the application does not run (interrupts are served between bytes); a frame addressed to another device costs ~0.6ms in mode 3 plus ~5us for each of its rising edges.
 - The acknowledgement is sent by the interrupt only for frames addressed to this device id (the one passed to `begin`) in local mode: not for shared mode, not in router mode (acknowledging other device ids).
 - Frames that find the queue full are not acknowledged. Call `bus.receive()` regularly, also inside loops that only transmit: two devices sending to each other back to back without it fill each other's queue and both keep retrying (seen on hardware). `send_packet_blocking` receives during its back-off only with `PJON_RECEIVE_WHILE_SENDING_BLOCKING`.
+- Projects with several source files that include PJON (not a single sketch): define `SWBB_WAKE_SHARED` for all of them and `SWBB_WAKE_IMPLEMENTATION` in exactly one (e.g. with `-D` build flags for the first, `#define` before the include for the second). Only that file then defines the interrupt handler and the receiver's state, otherwise the link fails with a duplicate `__vector_1`. The same applies to `SWBB_INTERRUPT` and to mode 7.
 - See [REVIEW-swbb-interrupt-wake.md](/REVIEW-swbb-interrupt-wake.md) for the measurements.
 
 ### Why not interrupts?

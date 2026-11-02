@@ -132,12 +132,16 @@ namespace swbb_m7 {
   #endif
   #ifdef SWBB_M7_STATS
     #define SWBB_M7_STAT(X) X
-    static volatile uint16_t fail_long = 0, fail_short = 0, fail_start = 0,
-      fail_stop = 0, fail_late = 0;
-    static volatile uint8_t max_ticks = 0;
-    static volatile uint16_t overruns = 0, collisions = 0;
+    SWBB_STATE(volatile uint16_t fail_long, 0);
+    SWBB_STATE(volatile uint16_t fail_short, 0);
+    SWBB_STATE(volatile uint16_t fail_start, 0);
+    SWBB_STATE(volatile uint16_t fail_stop, 0);
+    SWBB_STATE(volatile uint16_t fail_late, 0);
+    SWBB_STATE(volatile uint8_t max_ticks, 0);
+    SWBB_STATE(volatile uint16_t overruns, 0);
+    SWBB_STATE(volatile uint16_t collisions, 0);
     #ifdef SWBB_M7_WINDOW_STATS
-      static volatile uint16_t window_hist[16];
+      SWBB_STATE(volatile uint16_t window_hist[16], {});
     #endif
   #else
     #define SWBB_M7_STAT(X)
@@ -403,12 +407,16 @@ namespace swbb_m7 {
       uint8_t  data[PJON_PACKET_MAX_LENGTH];
       uint16_t length;
     };
-    static Frame queue[SWBB_WAKE_FRAMES];
-    static volatile uint8_t head = 0, count = 0;
-    static uint8_t id = 0;
-    static uint32_t last_rise = 0;
+    SWBB_STATE(Frame queue[SWBB_WAKE_FRAMES], {});
+    SWBB_STATE(volatile uint8_t head, 0);
+    SWBB_STATE(volatile uint8_t count, 0);
+    SWBB_STATE(uint8_t id, 0);
+    SWBB_STATE(uint32_t last_rise, 0);
     #ifdef SWBB_M7_STATS
-      static volatile uint16_t wakes = 0, stored = 0, failed = 0, dropped = 0;
+      SWBB_STATE(volatile uint16_t wakes, 0);
+      SWBB_STATE(volatile uint16_t stored, 0);
+      SWBB_STATE(volatile uint16_t failed, 0);
+      SWBB_STATE(volatile uint16_t dropped, 0);
     #endif
 
     static void wake_receive() {
@@ -588,7 +596,7 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
     bool _collision = false;
 };
 
-#ifdef SWBB_INTERRUPT_WAKE
+#if defined(SWBB_INTERRUPT_WAKE) && !defined(SWBB_STATE_EXTERN)
 ISR(SWBB_M7_WAKE_VECT) {
   using namespace swbb_m7;
   uint32_t now = PJON_MICROS();

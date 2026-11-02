@@ -70,22 +70,30 @@
 namespace swbb_irq {
   enum { IDLE, INIT, DATA, PAD_LOW, PAD_HIGH, IGNORE };
 
-  static volatile uint8_t  buf[PJON_PACKET_MAX_LENGTH];
-  static volatile uint16_t wr = 0;        // bytes written in buf
-  static volatile uint8_t  filling = 0;   // the interrupt is writing buf
-  static volatile uint8_t  ready = 0;     // buf holds a frame not consumed
-  static volatile uint8_t  acked = 0;     // acknowledged by the interrupt
-  static volatile uint16_t frames = 0;    // statistics: frames started
-  static volatile uint16_t ignored = 0;   // frames ignored (buffer occupied)
-  static volatile uint32_t end_us = 0;    // micros() at the end of the frame
+  SWBB_STATE(volatile uint8_t buf[PJON_PACKET_MAX_LENGTH], {});
+  SWBB_STATE(volatile uint16_t wr, 0);        // bytes written in buf
+  SWBB_STATE(volatile uint8_t filling, 0);   // the interrupt is writing buf
+  SWBB_STATE(volatile uint8_t ready, 0);     // buf holds a frame not consumed
+  SWBB_STATE(volatile uint8_t acked, 0);     // acknowledged by the interrupt
+  SWBB_STATE(volatile uint16_t frames, 0);    // statistics: frames started
+  SWBB_STATE(volatile uint16_t ignored, 0);   // frames ignored (buffer occupied)
+  SWBB_STATE(volatile uint32_t end_us, 0);    // micros() at the end of the frame
 
-  static uint8_t  state = IDLE, level = 0, pads = 0, pos = 0;
-  static uint16_t sync = 0, high_start = 0, bits = 0;
+  SWBB_STATE(uint8_t state, IDLE);
+  SWBB_STATE(uint8_t level, 0);
+  SWBB_STATE(uint8_t pads, 0);
+  SWBB_STATE(uint8_t pos, 0);
+  SWBB_STATE(uint16_t sync, 0);
+  SWBB_STATE(uint16_t high_start, 0);
+  SWBB_STATE(uint16_t bits, 0);
 
   #ifdef SWBB_INTERRUPT_ACK
-    static uint8_t  id = 0, ack = 0, header = 0, crc8 = 0;
-    static uint16_t length = 0;
-    static uint32_t crc32 = 0;
+    SWBB_STATE(uint8_t id, 0);
+    SWBB_STATE(uint8_t ack, 0);
+    SWBB_STATE(uint8_t header, 0);
+    SWBB_STATE(uint8_t crc8, 0);
+    SWBB_STATE(uint16_t length, 0);
+    SWBB_STATE(uint32_t crc32, 0);
   #endif
 
   #ifdef SWBB_INTERRUPT_ACK
@@ -476,6 +484,7 @@ namespace swbb_irq {
   }
 }
 
+#ifndef SWBB_STATE_EXTERN
 ISR(SWBB_IRQ_VECT) {
   uint16_t t = TCNT1;
   uint8_t l = (SWBB_IN >> SWBB_BIT) & 1;
@@ -502,3 +511,4 @@ ISR(TIMER1_COMPA_vect) {
     PORTD &= ~8;
   #endif
 }
+#endif

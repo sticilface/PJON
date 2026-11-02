@@ -900,6 +900,21 @@ class SoftwareBitBang {
 };
 #endif
 
+/* State shared by an interrupt handler and the strategy (interrupt
+   receivers and mode 7). In a project of several source files that include
+   PJON, define SWBB_WAKE_SHARED for all of them and SWBB_WAKE_IMPLEMENTATION
+   in exactly one (before any include): only that one defines the state and
+   the interrupt handlers, the others declare them (extern). Without
+   SWBB_WAKE_SHARED (one source file, e.g. a sketch) nothing changes. */
+#if defined(SWBB_WAKE_SHARED) && !defined(SWBB_WAKE_IMPLEMENTATION)
+  #define SWBB_STATE_EXTERN
+  #define SWBB_STATE(DECL, INIT) extern DECL
+#elif defined(SWBB_WAKE_SHARED)
+  #define SWBB_STATE(DECL, INIT) DECL = INIT
+#else
+  #define SWBB_STATE(DECL, INIT) static DECL = INIT
+#endif
+
 #ifdef SWBB_INTERRUPT
   #undef SoftwareBitBang
   #include "SoftwareBitBangIRQ.h"
