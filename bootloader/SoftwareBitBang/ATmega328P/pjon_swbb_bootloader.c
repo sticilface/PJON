@@ -1,9 +1,12 @@
-/* PJON SoftwareBitBang bootloader for ATmega328P
+/* PJON SoftwareBitBang bootloader for ATmega328P and ATmega2560
    ___________________________________________________________________________
 
    Minimal bootloader receiving a firmware image over a single wire PJON bus
    using the SoftwareBitBang strategy (PJDL v5.0). It is written in plain C
    without the PJON library or the Arduino core so that it fits in 2kB.
+   The same source builds for the ATmega328P (and 88/168) and for the
+   ATmega2560/1280 (MCU=atmega2560 in the Makefile): 256 bytes flash pages,
+   addresses above 64kB written with the 'X' command (24 bits address).
 
    Supported (everything else is not needed to flash and is dropped):
    - PJDL frame reception and synchronous acknowledgement, one mode chosen
@@ -14,7 +17,8 @@
    - CRC32 packet verification (covers meta-data, the CRC8 is not checked)
    - Optional sender info and packet id (skipped), port PJON_BOOT_PORT
    - Commands: ping, write a page chunk (the page is erased, written and
-     verified after its last chunk), start application, assign device id
+     verified after its last chunk; 'X' with a 24 bits address on MCUs with
+     more than 64kB of flash), start application, assign device id
      (see src/utils/bootloader/PJON_Bootloader.h for the protocol)
    - Announcements to the master while waiting without timeout (fresh
      device, failed application start), with medium access check
@@ -22,8 +26,10 @@
      written at ISP time) kept in EEPROM
    - Boot guard: the first start after an update is supervised by the
      watchdog until the application calls pjon_boot_app_ok()
-   - Serial upload compatible with Optiboot (STK500v1, as used by the
-     Arduino IDE and avrdude -c arduino) on USART0, if SERIAL_UPLOAD
+   - Serial upload on USART0, if SERIAL_UPLOAD: compatible with Optiboot
+     on the ATmega328P (STK500v1, Arduino IDE and avrdude -c arduino), with
+     the Arduino Mega bootloader on the ATmega2560 (STK500v2, Arduino IDE
+     and avrdude -c wiring)
 
    Not supported: shared mode, MAC, extended length, broadcast, routing,
    receiving while a page is being written (the sender's ping is retried by
@@ -74,8 +80,8 @@
 
 /* Build time configuration (see Makefile) --------------------------------- */
 
-#ifndef PJON_PIN          // Arduino pin number of the bus (0-19, A0 = 14)
-  #define PJON_PIN       12
+#ifndef PJON_PIN          // Arduino pin number of the bus (328P: 0-19,
+  #define PJON_PIN       12 // A0 = 14; Mega: pins of ports A-G, e.g. 3)
 #endif
 #ifndef DEVICE_ID         // Id used if none is passed or saved in EEPROM
   #define DEVICE_ID      PJON_BOOT_UNASSIGNED
@@ -100,8 +106,8 @@
    itself, and the bootloader refuses writes from BOOT_START up. */
 #if LOW_SECTION
   #define LOWTEXT __attribute__((noinline, section(".bootlow")))
-#else
-  #define LOWTEXT
+#else // not inlined: main() must not need a stack frame (see main())
+  #define LOWTEXT __attribute__((noinline))
 #endif
 #ifndef BOOT_GUARD_S      // Seconds the app has to call pjon_boot_app_ok()
   #define BOOT_GUARD_S    8  // 0 (off), 1, 2, 4 or 8
@@ -135,26 +141,35 @@
 #define ANNOUNCE_FIRST_MS  5000
 #define ANNOUNCE_MAX_MS   60000
 
-/* Pin mapping (Arduino numbering, ATmega328P) ----------------------------- */
-
-#if PJON_PIN >= 0 && PJON_PIN <= 7
-  #define BUS_PORT PORTD
-  #define BUS_DDR  DDRD
-  #define BUS_IN   PIND
-  #define BUS_BIT  (PJON_PIN)
-#elif PJON_PIN >= 8 && PJON_PIN <= 13
-  #define BUS_PORT PORTB
-  #define BUS_DDR  DDRB
-  #define BUS_IN   PINB
-  #define BUS_BIT  (PJON_PIN - 8)
-#elif PJON_PIN >= 14 && PJON_PIN <= 19
-  #define BUS_PORT PORTC
-  #define BUS_DDR  DDRC
-  #define BUS_IN   PINC
-  #define BUS_BIT  (PJON_PIN - 14)
+/* Flash addresses: 16 bits up to 64kB of flash, 32 bits above (ATmega2560:
+   the flash above 64kB is read with ELPM, written with the extended SPM
+   macros of avr/boot.h) */
+#if FLASHEND > 0xFFFF
+  #define FAR_FLASH 1
+  typedef uint32_t flash_address_t;
+  #define FLASH_READ_BYTE(A) pgm_read_byte_far(A)
 #else
-  #error "PJON_PIN must be an Arduino pin number between 0 and 19"
+  #define FAR_FLASH 0
+  typedef uint16_t flash_address_t;
+  #define FLASH_READ_BYTE(A) pgm_read_byte(A)
 #endif
+/* Index in a flash page (128 or 256 bytes) */
+#if SPM_PAGESIZE > 128
+  typedef uint16_t page_index_t;
+#else
+  typedef uint8_t page_index_t;
+#endif
+
+/* Pin mapping (Arduino numbering): the same table as the SoftwareBitBang
+   direct port access implementation (ATmega328P pins 0-19, Mega pins of
+   ports A-G) ------------------------------------------------------------- */
+
+#define SWBB_PIN PJON_PIN
+#include "strategies/SoftwareBitBang/SoftwareBitBangAVRPins.h"
+#define BUS_PORT SWBB_PORT
+#define BUS_DDR  SWBB_DDR
+#define BUS_IN   SWBB_IN
+#define BUS_BIT  SWBB_BIT
 
 #define BUS_HIGH()     (BUS_IN & (1 << BUS_BIT))
 #define BUS_DRIVE()    (BUS_DDR |= (1 << BUS_BIT))
@@ -310,7 +325,11 @@
 #define PJON_PACKET_ID_BIT  0x80
 
 /* id + header + length + CRC8 + tx id + packet id + port + payload + CRC32 */
-#define BUFFER_LENGTH (PJON_BOOT_MAX_OVERHEAD + PJON_BOOT_WRITE_LENGTH)
+#if FAR_FLASH
+  #define BUFFER_LENGTH (PJON_BOOT_MAX_OVERHEAD + PJON_BOOT_WRITE_FAR_LENGTH)
+#else
+  #define BUFFER_LENGTH (PJON_BOOT_MAX_OVERHEAD + PJON_BOOT_WRITE_LENGTH)
+#endif
 #define MIN_LENGTH    (4 + 2 + 1 + 4)
 
 #if BUFFER_LENGTH > 255
@@ -326,7 +345,7 @@
 #define NOINIT __attribute__((section(".noinit")))
 static uint8_t buffer[BUFFER_LENGTH] NOINIT;  // received or sent packet
 static uint8_t page[SPM_PAGESIZE] NOINIT;     // page being assembled
-static uint16_t page_address NOINIT;          // its address, NO_PAGE if none
+static flash_address_t page_address NOINIT;   // its address, NO_PAGE if none
 static uint8_t next_chunk NOINIT;             // chunks received in order
 static uint8_t last_page_ok NOINIT;           // result of the last page write
 static uint8_t device_id NOINIT;
@@ -338,7 +357,7 @@ static uint32_t frame_crc NOINIT;             // CRC32 of the received frame
 static uint16_t byte_end NOINIT;              // Timer1 at the end of a byte
 #endif
 
-#define NO_PAGE 0xFFFF
+#define NO_PAGE ((flash_address_t)-1)
 
 /* Error detection --------------------------------------------------------- */
 
@@ -362,11 +381,14 @@ static const uint32_t crc32_table[16]
   0x9B64C2B0UL, 0x86D3D2D4UL, 0xA00AE278UL, 0xBDBDF21CUL
 };
 
+#if FAR_FLASH
+  #error "CRC32_TABLE is not supported above 64kB of flash"
+#endif
 __attribute__((noinline))
 static uint32_t crc32_update(uint32_t crc, uint8_t b) {
   crc ^= b;
-  crc = (crc >> 4) ^ pgm_read_dword(&crc32_table[crc & 15]);
-  crc = (crc >> 4) ^ pgm_read_dword(&crc32_table[crc & 15]);
+  crc = (crc >> 4) ^ CRC32_TABLE(crc & 15);
+  crc = (crc >> 4) ^ CRC32_TABLE(crc & 15);
   return crc;
 }
 #else
@@ -954,21 +976,21 @@ LOWTEXT static void load_serial(void) {
 
 /* Flash ------------------------------------------------------------------- */
 
-static uint8_t page_matches(uint16_t address, const uint8_t *data) {
-  for(uint8_t i = 0; i < SPM_PAGESIZE; i++)
-    if(pgm_read_byte(address + i) != data[i]) return 0;
+static uint8_t page_matches(flash_address_t address, const uint8_t *data) {
+  for(page_index_t i = 0; i < SPM_PAGESIZE; i++)
+    if(FLASH_READ_BYTE(address + i) != data[i]) return 0;
   return 1;
 }
 
 /* Erases, writes and verifies a page. Returns 1 if the page content in flash
    is correct. The bootloader section can not be overwritten. */
-static uint8_t write_page(uint16_t address, const uint8_t *data) {
+static uint8_t write_page(flash_address_t address, const uint8_t *data) {
   if((address & (SPM_PAGESIZE - 1)) || (address >= BOOT_START)) return 0;
   if(page_matches(address, data)) return 1;
   eeprom_busy_wait(); // SPM is not possible while the EEPROM is written
   boot_page_erase(address);
   boot_spm_busy_wait();
-  for(uint8_t i = 0; i < SPM_PAGESIZE; i += 2)
+  for(page_index_t i = 0; i < SPM_PAGESIZE; i += 2)
     boot_page_fill(address + i, data[i] | (data[i + 1] << 8));
   boot_page_write(address);
   boot_spm_busy_wait();
@@ -981,10 +1003,10 @@ static uint8_t write_page(uint16_t address, const uint8_t *data) {
    of the page (acknowledge, then call finish_page). A chunk that is not the
    next one in order (or a repetition of the previous one) invalidates the
    page, that then fails in finish_page. */
-static uint8_t store_chunk(uint16_t address, const uint8_t *data) {
+static uint8_t store_chunk(flash_address_t address, const uint8_t *data) {
   if((address & (PJON_BOOT_CHUNK_SIZE - 1)) || (address >= BOOT_START))
     return 0;
-  uint16_t base = address & ~(SPM_PAGESIZE - 1);
+  flash_address_t base = address & ~(flash_address_t)(SPM_PAGESIZE - 1);
   uint8_t offset = address & (SPM_PAGESIZE - 1);
   uint8_t index = offset / PJON_BOOT_CHUNK_SIZE;
   if(!index) { // first chunk, start the page
@@ -1038,8 +1060,16 @@ static void start_app(void);
 #define STK_SW_MAJOR    0x81
 #define STK_SW_MINOR    0x82
 
+/* RX0 pin: PD0 on the ATmega328P, PE0 on the ATmega2560 */
+#if FAR_FLASH
+  #define SERIAL_RX_PORT PORTE
+#else
+  #define SERIAL_RX_PORT PORTD
+#endif
+#define SERIAL_RX_MASK 1
+
 static void serial_init(void) {
-  PORTD |= 1; // pull-up on RX: no noise when nothing is connected
+  SERIAL_RX_PORT |= SERIAL_RX_MASK; // pull-up on RX: no noise when idle
   UCSR0A = (1 << U2X0);
   UBRR0 = (F_CPU + 4UL * SERIAL_BAUD) / (8UL * SERIAL_BAUD) - 1;
   UCSR0B = (1 << RXEN0) | (1 << TXEN0);
@@ -1058,6 +1088,9 @@ static uint8_t getch(void) {
   wdt_reset();
   return UDR0;
 }
+
+#if !FAR_FLASH
+#define SERIAL_START STK_GET_SYNC
 
 static void skip(uint8_t count) {
   while(count--) getch();
@@ -1139,6 +1172,191 @@ static void serial_session(uint8_t c) {
     putch(ok ? STK_OK : STK_FAILED);
   }
 }
+#else
+/* Serial upload, STK500v2 subset (ATmega2560: Arduino IDE and avrdude -c
+   wiring, like the Arduino Mega bootloader). A message is 0x1B seq sizeH
+   sizeL 0x0E body[size] checksum (XOR of all the previous bytes); the
+   answer uses the same sequence number. */
+
+#define STK2_START            0x1B
+#define SERIAL_START          STK2_START
+#define STK2_TOKEN            0x0E
+#define STK2_SIGN_ON          0x01
+#define STK2_SET_PARAMETER    0x02
+#define STK2_GET_PARAMETER    0x03
+#define STK2_LOAD_ADDRESS     0x06
+#define STK2_ENTER_PROGMODE   0x10
+#define STK2_LEAVE_PROGMODE   0x11
+#define STK2_CHIP_ERASE       0x12
+#define STK2_PROGRAM_FLASH    0x13
+#define STK2_READ_FLASH       0x14
+#define STK2_PROGRAM_EEPROM   0x15
+#define STK2_READ_EEPROM      0x16
+#define STK2_READ_FUSE        0x18
+#define STK2_READ_LOCK        0x1A
+#define STK2_READ_SIGNATURE   0x1B
+#define STK2_SPI_MULTI        0x1D
+#define STK2_OK               0x00
+#define STK2_FAILED           0xC0
+#define STK2_UNKNOWN          0xC9
+#define STK2_PARAM_HW_VER     0x90
+#define STK2_PARAM_SW_MAJOR   0x91
+#define STK2_PARAM_SW_MINOR   0x92
+#define STK2_PARAM_VTARGET    0x94
+
+/* First body bytes of a message: command and up to 9 parameters; the data
+   of a flash write goes straight into page[] */
+static uint8_t stk2_head[10] NOINIT;
+static uint8_t stk2_sum NOINIT;
+
+static void stk2_put(uint8_t c) {
+  stk2_sum ^= c;
+  putch(c);
+}
+
+static void stk2_answer_start(uint8_t seq, uint16_t size) {
+  stk2_sum = 0;
+  stk2_put(STK2_START);
+  stk2_put(seq);
+  stk2_put(size >> 8);
+  stk2_put(size & 0xFF);
+  stk2_put(STK2_TOKEN);
+}
+
+/* Reads a whole message: returns its size (0 if malformed), the first 10
+   body bytes in stk2_head, the rest (flash data) in page[] */
+static uint16_t stk2_receive(uint8_t first, uint8_t *seq) {
+  while(first != STK2_START) first = getch(); // resynchronize
+  uint8_t sum = first, c;
+  *seq = getch();
+  uint16_t size = getch();
+  size = (size << 8) | getch();
+  c = getch();
+  sum ^= *seq ^ (size >> 8) ^ (size & 0xFF) ^ c;
+  if(c != STK2_TOKEN) return 0;
+  for(uint16_t i = 0; i < size; i++) {
+    c = getch();
+    sum ^= c;
+    if(i < sizeof(stk2_head)) stk2_head[i] = c;
+    else if(i - sizeof(stk2_head) < SPM_PAGESIZE)
+      page[i - sizeof(stk2_head)] = c;
+  }
+  if(getch() != sum) return 0;
+  return size;
+}
+
+/* Serves an STK500v2 session started by the byte c. Does not return: it
+   ends starting the application (LEAVE_PROGMODE) or with a watchdog
+   reset (no byte received for 1s). */
+LOWTEXT static void serial_session(uint8_t c) __attribute__((noreturn));
+static void serial_session(uint8_t c) {
+  uint32_t loaded = 0;  // last LOAD_ADDRESS value (word address, EEPROM)
+  uint32_t address = 0; // byte address (flash), auto incremented
+  uint8_t written = 0, seq;
+  wdt_enable(WDTO_1S);
+  for(;; c = getch()) {
+    if(!stk2_receive(c, &seq)) continue; // bad message: the host retries
+    uint8_t cmd = stk2_head[0], status = STK2_OK, leave = 0;
+    uint16_t length = ((uint16_t)stk2_head[1] << 8) | stk2_head[2];
+    switch(cmd) {
+      case STK2_SIGN_ON: // "AVRISP_2", what avrdude -c wiring expects
+        stk2_answer_start(seq, 3 + 8);
+        stk2_put(cmd); stk2_put(STK2_OK); stk2_put(8);
+        stk2_put('A'); stk2_put('V'); stk2_put('R'); stk2_put('I');
+        stk2_put('S'); stk2_put('P'); stk2_put('_'); stk2_put('2');
+        stk2_put(stk2_sum);
+        continue;
+      case STK2_GET_PARAMETER: {
+        uint8_t p = stk2_head[1], v = 0;
+        if(p == STK2_PARAM_HW_VER) v = 0x0F;
+        else if(p == STK2_PARAM_SW_MAJOR) v = 2;
+        else if(p == STK2_PARAM_SW_MINOR) v = 0x0A;
+        else if(p == STK2_PARAM_VTARGET) v = 50;
+        stk2_answer_start(seq, 3);
+        stk2_put(cmd); stk2_put(STK2_OK); stk2_put(v);
+        stk2_put(stk2_sum);
+        continue;
+      }
+      case STK2_LOAD_ADDRESS:
+        loaded = ((uint32_t)stk2_head[1] << 24) |
+          ((uint32_t)stk2_head[2] << 16) |
+          ((uint16_t)stk2_head[3] << 8) | stk2_head[4];
+        address = loaded << 1; // bit 31 (extended address flag) shifted out
+        break;
+      case STK2_PROGRAM_FLASH:
+        /* Full pages only, written and verified; not the bootloader */
+        if((length == SPM_PAGESIZE) && write_page(address, page)) written = 1;
+        else status = STK2_FAILED;
+        address += length;
+        break;
+      case STK2_READ_FLASH:
+      case STK2_READ_EEPROM:
+        stk2_answer_start(seq, length + 3);
+        stk2_put(cmd); stk2_put(STK2_OK);
+        for(uint16_t i = 0; i < length; i++) {
+          if(cmd == STK2_READ_FLASH) stk2_put(pgm_read_byte_far(address++));
+          else stk2_put(eeprom_read_byte((uint8_t *)(uint16_t)(loaded++)));
+        }
+        stk2_put(STK2_OK);
+        stk2_put(stk2_sum);
+        continue;
+      case STK2_READ_SIGNATURE:
+      case STK2_READ_FUSE:
+      case STK2_READ_LOCK:
+      case STK2_SPI_MULTI: {
+        /* ISP instruction in stk2_head[2..5] (SPI_MULTI: [4..7]) */
+        uint8_t *i = stk2_head + ((cmd == STK2_SPI_MULTI) ? 4 : 2), v = 0;
+        if(i[0] == 0x30) // signature byte i[2]
+          v = (i[2] == 0) ? SIGNATURE_0 :
+            ((i[2] == 1) ? SIGNATURE_1 : SIGNATURE_2);
+        else if((i[0] == 0x50) && (i[1] == 0x00))
+          v = boot_lock_fuse_bits_get(GET_LOW_FUSE_BITS);
+        else if((i[0] == 0x58) && (i[1] == 0x08))
+          v = boot_lock_fuse_bits_get(GET_HIGH_FUSE_BITS);
+        else if((i[0] == 0x50) && (i[1] == 0x08))
+          v = boot_lock_fuse_bits_get(GET_EXTENDED_FUSE_BITS);
+        else if((i[0] == 0x58) && (i[1] == 0x00))
+          v = boot_lock_fuse_bits_get(GET_LOCK_BITS);
+        if(cmd == STK2_SPI_MULTI) { // answer: rx bytes, the 4th is the value
+          stk2_answer_start(seq, 7);
+          stk2_put(cmd); stk2_put(STK2_OK);
+          stk2_put(i[0]); stk2_put(i[1]); stk2_put(i[2]); stk2_put(v);
+          stk2_put(STK2_OK);
+        } else {
+          stk2_answer_start(seq, 4);
+          stk2_put(cmd); stk2_put(STK2_OK); stk2_put(v); stk2_put(STK2_OK);
+        }
+        stk2_put(stk2_sum);
+        continue;
+      }
+      case STK2_LEAVE_PROGMODE:
+        leave = 1;
+        break;
+      case STK2_SET_PARAMETER:
+      case STK2_ENTER_PROGMODE:
+      case STK2_CHIP_ERASE:     // pages are rewritten whole, like Arduino's
+      case STK2_PROGRAM_EEPROM: // EEPROM not written (as the 328P version)
+        break;
+      default:
+        status = STK2_UNKNOWN;
+    }
+    stk2_answer_start(seq, 2);
+    stk2_put(cmd);
+    stk2_put(status);
+    stk2_put(stk2_sum);
+    if(leave) {
+      while(!(UCSR0A & (1 << UDRE0)));
+      /* A serial upload does not use the boot guard */
+      if(written) eeprom_update_byte(EEPROM_FLAG, 0xFF);
+      __builtin_avr_delay_cycles(CYCLES(200)); // last byte out
+      wdt_disable();
+      start_app();
+      wdt_enable(WDTO_15MS); // no application: restart the bootloader
+      for(;;);
+    }
+  }
+}
+#endif
 #endif
 
 static uint8_t app_pending(void) {
@@ -1156,10 +1374,16 @@ static void start_app(void) {
   BUS_RELEASE();
 #if SERIAL_UPLOAD
   UCSR0B = 0;
-  PORTD &= ~1;
+  SERIAL_RX_PORT &= ~SERIAL_RX_MASK;
 #endif
 #if BOOT_GUARD_S
   if(app_pending()) wdt_enable(BOOT_GUARD_WDTO);
+#endif
+#if FAR_FLASH
+  RAMPZ = 0;
+  #ifdef EIND
+    EIND = 0;
+  #endif
 #endif
   /* Reset flags also in r2, like Optiboot */
   __asm__ __volatile__ (
@@ -1223,8 +1447,8 @@ int main(void) {
 
   for(;;) {
 #if SERIAL_UPLOAD
-    if((UCSR0A & (1 << RXC0)) && (UDR0 == STK_GET_SYNC))
-      serial_session(STK_GET_SYNC);
+    if((UCSR0A & (1 << RXC0)) && (UDR0 == SERIAL_START))
+      serial_session(SERIAL_START);
 #endif
     if(TIFR1 & (1 << TOV1)) {
       TIFR1 = (1 << TOV1);
@@ -1276,7 +1500,19 @@ int main(void) {
     } else if(
       (payload_length == PJON_BOOT_WRITE_LENGTH) &&
       (payload[0] == PJON_BOOT_CMD_WRITE)
-    ) ok = store_chunk((payload[1] << 8) | payload[2], payload + 3);
+    ) ok = store_chunk( // 16 bits: no sign extension of int (16 bits)
+      (uint16_t)((payload[1] << 8) | payload[2]), payload + 3
+    );
+#if FAR_FLASH
+    else if(
+      (payload_length == PJON_BOOT_WRITE_FAR_LENGTH) &&
+      (payload[0] == PJON_BOOT_CMD_WRITE_FAR)
+    ) ok = store_chunk(
+      ((flash_address_t)payload[1] << 16) |
+      (uint16_t)((payload[2] << 8) | payload[3]),
+      payload + 4
+    );
+#endif
     else if(
       (payload_length == PJON_BOOT_ASSIGN_LENGTH) &&
       (payload[0] == PJON_BOOT_CMD_ASSIGN) &&

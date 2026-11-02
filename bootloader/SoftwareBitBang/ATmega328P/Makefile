@@ -1,11 +1,14 @@
 
-# PJON SoftwareBitBang bootloader for ATmega328P
+# PJON SoftwareBitBang bootloader for ATmega328P and ATmega2560
 #
 # Build:   make PJON_PIN=12
+#          make MCU=atmega2560 PJON_PIN=3                  (Arduino Mega)
 # Flash:   make flash ISP=usbasp   (fuses, bootloader and a random serial)
 #
 # Options (all optional):
-#   PJON_PIN          Arduino pin number of the PJON bus, 0-19 (A0=14)  [12]
+#   MCU               atmega328p or atmega2560                    [atmega328p]
+#   PJON_PIN          Arduino pin number of the PJON bus: 0-19 (A0=14) on the
+#                     328P [12], pins of ports A-G on the Mega [3 = PE5]
 #   DEVICE_ID         Device id used when none is passed by the application
 #                     or saved in EEPROM (255 = not assigned)            [255]
 #   MODE              SoftwareBitBang mode 1-7 (must match the bus)       [1]
@@ -17,9 +20,11 @@
 #   EXTRF_TIMEOUT_MS  Time spent in the bootloader after a reset pin reset,
 #                     0 disables entering the bootloader this way       [1000]
 #   F_CPU             Clock frequency in Hz                         [16000000]
-#   BOOT_SIZE         Flash used by the bootloader: 3072 (2kB boot section
-#                     + 1kB below it) or 4096; 1024 and 2048 are accepted
-#                     but it does not fit                               [3072]
+#   BOOT_SIZE         Flash used by the bootloader. ATmega328P: 3072 (2kB
+#                     boot section + 1kB below it) or 4096; 1024 and 2048
+#                     are accepted but it does not fit [3072]. ATmega2560:
+#                     4096 or 8192 (the size of the Arduino Mega
+#                     bootloader) [4096]
 #   CHUNK_SIZE        Bytes of flash per write packet, 16/32/64/128       [32]
 #                     (must match the uploader, see PJON_Bootloader.h)
 #   EESAVE            1 keeps the EEPROM content on chip erase            [1]
@@ -27,8 +32,9 @@
 #                     pjon_boot_app_ok(): 0 (off), 1, 2, 4 or 8            [8]
 #   EEPROM_ID_ADDR    EEPROM address of the device id, the 4 bytes serial
 #                     follows it (must match the application)         [1019]
-#   SERIAL_UPLOAD     1: Optiboot compatible serial upload (Arduino IDE,
-#                     avrdude -c arduino) on pins 0/1                     [1]
+#   SERIAL_UPLOAD     1: serial upload on USART0 (Arduino IDE): Optiboot
+#                     compatible on the 328P (avrdude -c arduino, pins 0/1),
+#                     STK500v2 on the Mega (avrdude -c wiring, pins 0/1)  [1]
 #   SERIAL_BAUD       Serial upload baud rate                        [115200]
 #   SERIAL            Serial written in EEPROM by "make flash": "random",
 #                     8 hex digits (first byte not FF), or "none" to leave
@@ -38,7 +44,13 @@
 
 SHELL := /bin/bash
 
-PJON_PIN         ?= 12
+MCU              ?= atmega328p
+ifeq ($(MCU),atmega2560)
+  PJON_PIN       ?= 3
+  BOOT_SIZE      ?= 4096
+else
+  PJON_PIN       ?= 12
+endif
 DEVICE_ID        ?= 255
 MODE             ?= 1
 TIMEOUT_MS       ?= 5000
@@ -56,7 +68,6 @@ ISP              ?= usbasp
 ISP_PORT         ?= usb
 AVRDUDE_FLAGS    ?=
 
-MCU     = atmega328p
 TARGET  = pjon_swbb_bootloader
 SOURCE  ?= $(TARGET).c
 PJON_SRC = ../../../src
@@ -66,22 +77,45 @@ PJON_SRC = ../../../src
 # ENTRY: start of the hardware boot section (reset vector, main()).
 # 3072 is a split layout: 2kB boot section + 1kB below it (.bootlow).
 LOW_SECTION = 0
-ifeq ($(BOOT_SIZE),1024)
-  BOOT_START = 0x7C00
-  HFUSE_BASE = 0xDC
-else ifeq ($(BOOT_SIZE),2048)
-  BOOT_START = 0x7800
-  HFUSE_BASE = 0xDA
-else ifeq ($(BOOT_SIZE),3072)
-  BOOT_START = 0x7400
-  ENTRY      = 0x7800
-  HFUSE_BASE = 0xDA
-  LOW_SECTION = 1
-else ifeq ($(BOOT_SIZE),4096)
-  BOOT_START = 0x7000
-  HFUSE_BASE = 0xD8
+ifeq ($(MCU),atmega2560)
+  # 256kB flash, boot section at the top; high fuse: OCDEN and JTAGEN off
+  FLASH_SIZE = 0x40000
+  ifeq ($(BOOT_SIZE),1024)
+    BOOT_START = 0x3FC00
+    HFUSE_BASE = 0xDE
+  else ifeq ($(BOOT_SIZE),2048)
+    BOOT_START = 0x3F800
+    HFUSE_BASE = 0xDC
+  else ifeq ($(BOOT_SIZE),4096)
+    BOOT_START = 0x3F000
+    HFUSE_BASE = 0xDA
+  else ifeq ($(BOOT_SIZE),8192)
+    BOOT_START = 0x3E000
+    HFUSE_BASE = 0xD8
+  else
+    $(error BOOT_SIZE must be 1024, 2048, 4096 or 8192)
+  endif
+else ifeq ($(MCU),atmega328p)
+  FLASH_SIZE = 0x8000
+  ifeq ($(BOOT_SIZE),1024)
+    BOOT_START = 0x7C00
+    HFUSE_BASE = 0xDC
+  else ifeq ($(BOOT_SIZE),2048)
+    BOOT_START = 0x7800
+    HFUSE_BASE = 0xDA
+  else ifeq ($(BOOT_SIZE),3072)
+    BOOT_START = 0x7400
+    ENTRY      = 0x7800
+    HFUSE_BASE = 0xDA
+    LOW_SECTION = 1
+  else ifeq ($(BOOT_SIZE),4096)
+    BOOT_START = 0x7000
+    HFUSE_BASE = 0xD8
+  else
+    $(error BOOT_SIZE must be 1024, 2048, 3072 or 4096)
+  endif
 else
-  $(error BOOT_SIZE must be 1024, 2048, 3072 or 4096)
+  $(error MCU must be atmega328p or atmega2560)
 endif
 ENTRY ?= $(BOOT_START)
 
@@ -109,7 +143,7 @@ CFLAGS  = -mmcu=$(MCU) -DF_CPU=$(F_CPU)UL -Os -std=gnu99 -Wall -Wextra \
           -DBOOT_GUARD_S=$(BOOT_GUARD_S) \
           -DPJON_BOOT_EEPROM_ID_ADDR=$(EEPROM_ID_ADDR) \
           -DSERIAL_UPLOAD=$(SERIAL_UPLOAD) -DSERIAL_BAUD=$(SERIAL_BAUD) \
-          -DLOW_SECTION=$(LOW_SECTION)
+          -DLOW_SECTION=$(LOW_SECTION) -fno-jump-tables
 LDFLAGS = -nostartfiles -Wl,--section-start=.text=$(ENTRY) -Wl,--relax \
           $(if $(filter 1,$(LOW_SECTION)),-Wl$(comma)--section-start=.bootlow=$(BOOT_START))
 comma := ,
@@ -132,7 +166,7 @@ $(TARGET).lst: $(TARGET).elf
 size: $(TARGET).elf
 	@text=$$($(SIZE) -A $< | awk '/^\.text/ {t=$$2} /^\.data/ {d=$$2} END {print t+d}'); \
 	low=$$($(SIZE) -A $< | awk '/^\.bootlow/ {print $$2}'); low=$${low:-0}; \
-	room=$$(( 0x8000 - $(ENTRY) )); lowroom=$$(( $(ENTRY) - $(BOOT_START) )); \
+	room=$$(( $(FLASH_SIZE) - $(ENTRY) )); lowroom=$$(( $(ENTRY) - $(BOOT_START) )); \
 	echo "Bootloader size: $$(( text + low )) of $(BOOT_SIZE) bytes"; \
 	if [ $(LOW_SECTION) = 1 ]; then \
 	  echo "  boot section: $$text of $$room, below it: $$low of $$lowroom"; fi; \

@@ -37,15 +37,17 @@ AVRDUDE="avrdude -q -q -c arduino -p m328p -b 115200 -P $TARGET_PTY"
 ID=44
 mkdir -p "$BUILD"
 
-CXXFLAGS="-mmcu=atmega328p -Os -std=gnu++11 -fno-exceptions -fno-rtti
+CXXFLAGS="-Os -std=gnu++11 -fno-exceptions -fno-rtti
   -ffunction-sections -fdata-sections -Wl,--gc-sections -DARDUINO=10819
   -I$HERE/arduino -I$SRC"
 
-# sketch <ino> <output name> <extra flags...>
+# sketch <ino> <output name> <extra flags...>: built for SKETCH_MCU
+# (atmega328p by default)
 sketch() {
   local ino=$1 out=$2
   shift 2
-  avr-g++ ${ORIG_SRC:+-I$ORIG_SRC} $CXXFLAGS -DF_CPU=16000000UL "$@" -x c++ "$ino" -x none \
+  avr-g++ -mmcu=${SKETCH_MCU:-atmega328p} ${ORIG_SRC:+-I$ORIG_SRC} $CXXFLAGS \
+    -DF_CPU=16000000UL "$@" -x c++ "$ino" -x none \
     "$HERE/arduino/arduino_shim.cpp" "$HERE/app_marker.cpp" \
     -o "$BUILD/$out.elf" || exit 1
   avr-objcopy -O ihex -R .eeprom "$BUILD/$out.elf" "$BUILD/$out.hex"
@@ -71,6 +73,34 @@ build() {
     "$name-app_v2" $flags -DAPP_MARKER=2
   sketch "$EXAMPLES/Uploader/Uploader.ino" "$name-uploader" $flags
   sketch "$HERE/app_noguard.cpp" "$name-app_noguard" -DAPP_MARKER=3
+}
+
+# build_mega <name> <mode> [app flags] [uploader flags] [make options]:
+# ATmega2560 target
+# (bootloader and application on Mega pin 3 = PE5, application always with
+# SWBB_PIN 3: the portable implementation on Mega pin 3 does not work with
+# ATmega328P devices, see REVIEW-swbb-mega2560.md) and ATmega328P uploader
+# on pin 2 (portable, or SWBB_PIN 2 with DIRECT_IO=1 or modes 5-7)
+build_mega() {
+  local name=$1 mode=$2 app_extra=${3:-} up_extra=${4:-}
+  local options=${5-DEVICE_ID=$ID}
+  make -s -C "$BL_DIR" clean
+  make -s -C "$BL_DIR" MCU=atmega2560 PJON_PIN=3 MODE=$mode F_CPU=16000000 \
+    $options ${BL_SOURCE:+SOURCE=$BL_SOURCE} || exit 1
+  cp "$BL_DIR/pjon_swbb_bootloader.hex" "$BUILD/$name-bootloader.hex"
+  make -s -C "$BL_DIR" clean
+  local app="-DBUS_PIN=3 -DSWBB_PIN=3 -DSWBB_MODE=$mode $app_extra ${SKETCH_FLAGS:-}"
+  local upf="-DBUS_PIN=2 -DSWBB_MODE=$mode $up_extra ${SKETCH_FLAGS:-}"
+  if [ "${DIRECT_IO:-0}" = 1 ] || [ "$mode" -ge 5 ]; then
+    upf="$upf -DSWBB_PIN=2"
+  fi
+  SKETCH_MCU=atmega2560 sketch \
+    "$EXAMPLES/AppWithBootloaderHook/AppWithBootloaderHook.ino" \
+    "$name-app_v1" $app -DAPP_MARKER=1
+  SKETCH_MCU=atmega2560 sketch \
+    "$EXAMPLES/AppWithBootloaderHook/AppWithBootloaderHook.ino" \
+    "$name-app_v2" $app -DAPP_MARKER=2
+  sketch "$EXAMPLES/Uploader/Uploader.ino" "$name-uploader" $upf
 }
 
 SIM_PID=
@@ -106,12 +136,13 @@ result() {
 }
 
 # upload_test <name> <pin> [hex]: full update through the application hook
-# (app v1 running), checks that the target flash matches the HEX file
+# (app v1 running), checks that the target flash matches the HEX file.
+# MEGA_SIM (simulator options) and UPLOAD_FLAGS for an ATmega2560 target.
 upload_test() {
   local name=$1 pin=$2 hex=${3:-$BUILD/$1-app_v2.hex}
-  start_sim "$name" "$pin" -a "$BUILD/$name-app_v1.hex" -m 2 -t 120 \
-    -f "$BUILD/flash.bin"
-  $UPLOAD --port "$PTY" --id $ID --reply-timeout 60 "$hex" \
+  start_sim "$name" "$pin" -a "$BUILD/$name-app_v1.hex" -m 2 \
+    -t ${SIM_TIME:-120} -f "$BUILD/flash.bin" ${MEGA_SIM:-}
+  $UPLOAD --port "$PTY" --id $ID --reply-timeout 60 ${UPLOAD_FLAGS:-} "$hex" \
     | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
   local up=${PIPESTATUS[0]}
   wait_sim; local sim=$?
@@ -480,12 +511,181 @@ test_serial_reset() {
   result $?
 }
 
+# ATmega2560 target (bootloader built with MCU=atmega2560, Mega pin 3) ----
+MEGA="-M atmega2560 -P 3 -R 0x3F000" # BOOT_SIZE=4096
+MEGA_UP="--mcu atmega2560"
+
+mega_upload() { # mega_upload <name> [hex] [upload flags]
+  MEGA_SIM="$MEGA" UPLOAD_FLAGS="$MEGA_UP ${3:-}" PJON_BOOT_MCU=atmega2560 \
+    upload_test "$1" 2 "${2:-$BUILD/$1-app_v2.hex}"
+}
+
+test_mega_hook_upload() {
+  for mode in 1 3; do
+    echo "mega_hook_upload_m$mode: ATmega2560 app v1 -> bootloader via hook ->"
+    echo "  app v2 (Mega pin 3, ATmega328P uploader on pin 2, mode $mode)"
+    build_mega mg$mode $mode
+    mega_upload mg$mode
+    result $?
+  done
+}
+
+test_mega_timeout() {
+  echo "mega_timeout: ATmega2560, enter the bootloader, send nothing, app v1"
+  echo "  restarts after 5s"
+  build_mega mg3 3
+  start_sim mg3 2 $MEGA -a "$BUILD/mg3-app_v1.hex" -m 1 -w 1 -t 15
+  python3 client.py enter "$PTY" $ID | sed 's/^/    /'
+  wait_sim; local sim=$?
+  local delay
+  delay=$(awk '/target reset/ {r=$2} /GPIOR1 = 0x01/ {a=$2} END {
+    gsub("s","",r); gsub("s","",a); print a - r }' "$BUILD/sim.log")
+  echo "    application restarted ${delay}s after entering the bootloader"
+  awk -v d="$delay" 'BEGIN { exit !(d >= 5.0 && d <= 6.0) }'
+  [ $sim -eq 0 ] && [ $? -eq 0 ]
+  result $?
+}
+
+test_mega_fresh_chip() {
+  echo "mega_fresh_chip: ATmega2560 without application, the bootloader waits"
+  echo "  forever, upload app v2"
+  build_mega mg3 3
+  start_sim mg3 2 $MEGA -m 2 -t 120
+  sleep 8
+  $UPLOAD --port "$PTY" --id $ID --no-enter --reply-timeout 60 $MEGA_UP \
+    "$BUILD/mg3-app_v2.hex" | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  [ $up -eq 0 ] && [ $sim -eq 0 ]
+  result $?
+}
+
+test_mega_interrupted() {
+  echo "mega_interrupted: ATmega2560, upload stopped in the middle of a page,"
+  echo "  bootloader stays, retry works"
+  build_mega mg3 3
+  start_sim mg3 2 $MEGA -a "$BUILD/mg3-app_v1.hex" -m 2 -w 1 -t 120
+  PJON_BOOT_MCU=atmega2560 python3 client.py partial "$PTY" $ID \
+    "$BUILD/mg3-app_v2.hex" 10 | sed 's/^/    /'
+  sleep 8
+  $UPLOAD --port "$PTY" --id $ID --no-enter --reply-timeout 60 $MEGA_UP \
+    "$BUILD/mg3-app_v2.hex" | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  local runs
+  runs=$(grep -c "running application" "$BUILD/sim.log")
+  echo "    application started $runs times (expected 2)"
+  [ $up -eq 0 ] && [ $sim -eq 0 ] && [ "$runs" -eq 2 ]
+  result $?
+}
+
+test_mega_protection() {
+  echo "mega_protection: ATmega2560, bootloader section, unaligned and"
+  echo "  out of flash addresses are refused, far addresses accepted"
+  build_mega mg3 3
+  start_sim mg3 2 $MEGA -t 120
+  PJON_BOOT_MCU=atmega2560 python3 client.py protect "$PTY" $ID | sed 's/^/    /'
+  local client=${PIPESTATUS[0]}
+  kill "$SIM_PID" 2> /dev/null
+  wait "$SIM_PID" 2> /dev/null
+  [ $client -eq 0 ]
+  result $?
+}
+
+test_mega_chunks() {
+  echo "mega_chunks: ATmega2560 (256 bytes pages, far page), missing, out of"
+  echo "  order and repeated chunks"
+  build_mega mg3 3
+  start_sim mg3 2 $MEGA -t 300
+  PJON_BOOT_MCU=atmega2560 python3 client.py chunks "$PTY" $ID | sed 's/^/    /'
+  local client=${PIPESTATUS[0]}
+  kill "$SIM_PID" 2> /dev/null
+  wait "$SIM_PID" 2> /dev/null
+  [ $client -eq 0 ]
+  result $?
+}
+
+test_mega_modes() {
+  for mode in 6 7; do
+    echo "mega_mode_$mode: ATmega2560, full update in mode $mode (SWBB_PIN)"
+    build_mega mgf$mode $mode
+    mega_upload mgf$mode
+    result $?
+  done
+}
+
+test_mega_wake() {
+  echo "mega_wake: ATmega2560 application with SWBB_INTERRUPT_WAKE (INT5,"
+  echo "  pin 3), mode 6"
+  build_mega mgw6 6 "-DSWBB_INTERRUPT_WAKE"
+  mega_upload mgw6
+  result $?
+}
+
+test_mega_large() {
+  echo "mega_large: ATmega2560, 80kB image (far addresses, 'X'), mode 7"
+  build_mega mgf7 7
+  python3 client.py large "$BUILD/mgf7-app_v2.hex" "$BUILD/mgf7-large.hex" \
+    0x14000 | sed 's/^/    /'
+  SIM_TIME=300 mega_upload mgf7 "$BUILD/mgf7-large.hex"
+  result $?
+  echo "mega_far: ATmega2560, sparse image with pages at 64kB, 128kB and right"
+  echo "  below the bootloader (0x3F700), mode 7"
+  PJON_BOOT_MCU=atmega2560 python3 client.py far "$BUILD/mgf7-app_v2.hex" \
+    "$BUILD/mgf7-far.hex" | sed 's/^/    /'
+  mega_upload mgf7 "$BUILD/mgf7-far.hex" --sparse
+  result $?
+}
+
+test_mega_provision() {
+  echo "mega_provision: fresh ATmega2560 (erased EEPROM) announces itself,"
+  echo "  gets id 45 and app v1, then app v1 is updated to app v2 (hook)"
+  build_mega mpv 1 "" "" ""
+  start_sim mpv 2 $MEGA -m 2 -t 150 -E "$BUILD/mpv-eeprom"
+  $UPLOAD --port "$PTY" --provision 45 --reply-timeout 60 $MEGA_UP \
+    "$BUILD/mpv-app_v1.hex" | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  $UPLOAD --port "$PTY" --id 45 --reply-timeout 60 $MEGA_UP \
+    "$BUILD/mpv-app_v2.hex" | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  [ ${PIPESTATUS[0]} -eq 0 ] || up=1
+  wait_sim; local sim=$?
+  python3 client.py eeprom "$BUILD/mpv-eeprom0.bin" 45 | sed 's/^/    /'
+  local ee=${PIPESTATUS[0]}
+  [ $up -eq 0 ] && [ $sim -eq 0 ] && [ $ee -eq 0 ]
+  result $?
+}
+
+test_mega_serial() {
+  echo "mega_serial: fresh ATmega2560, 136kB image (app v1 + random data,"
+  echo "  above 128kB) uploaded over serial with avrdude -c wiring (Arduino"
+  echo "  IDE, STK500v2; written and verified), then app v2 over PJON"
+  build_mega ms 1
+  python3 client.py large "$BUILD/ms-app_v1.hex" "$BUILD/ms-large.hex" \
+    0x22000 | sed 's/^/    /'
+  start_sim ms 2 $MEGA -S -m 2 -t 300 -f "$BUILD/flash.bin"
+  avrdude -q -q -c wiring -p m2560 -b 115200 -P "$TARGET_PTY" -D \
+    -U flash:w:"$BUILD/ms-large.hex":i 2>&1 | grep -v "TIOCMGET" | sed 's/^/    /'
+  local serial=${PIPESTATUS[0]}
+  echo "    avrdude exit code: $serial"
+  $UPLOAD --port "$PTY" --id $ID --reply-timeout 60 $MEGA_UP \
+    "$BUILD/ms-app_v2.hex" | tr '\r' '\n' | grep -v '^writing' | sed 's/^/    /'
+  local up=${PIPESTATUS[0]}
+  wait_sim; local sim=$?
+  python3 client.py check "$BUILD/ms-app_v2.hex" "$BUILD/flash.bin" | sed 's/^/    /'
+  local flash=${PIPESTATUS[0]}
+  [ $serial -eq 0 ] && [ $up -eq 0 ] && [ $sim -eq 0 ] && [ $flash -eq 0 ]
+  result $?
+}
+
 gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/sim" sim.c \
   -lsimavrparts -lsimavr -lelf -lpthread -lutil || exit 1
 
 TESTS=${*:-hook_upload timeout fresh_chip interrupted pins modes 8mhz \
   large_image protection router chunks fast_modes mode7 provision \
-  provision_two boot_guard serial_fresh serial_reset announce_modes}
+  provision_two boot_guard serial_fresh serial_reset announce_modes \
+  mega_hook_upload mega_timeout mega_fresh_chip mega_interrupted \
+  mega_protection mega_chunks mega_modes mega_wake mega_large \
+  mega_provision mega_serial}
 for t in $TESTS; do "test_$t"; done
 echo "passed: $PASSED, failed: $FAILED"
 [ $FAILED -eq 0 ]

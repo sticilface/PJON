@@ -1,6 +1,6 @@
-## PJON SoftwareBitBang bootloader for ATmega328P
+## PJON SoftwareBitBang bootloader for ATmega328P and ATmega2560
 
-A 3kB bootloader that updates the firmware of an ATmega328P (ATmega328P-AU / TQFP, or DIP) over a single wire [SoftwareBitBang](/src/strategies/SoftwareBitBang/README.md) PJON bus, and also over the serial port like Optiboot (Arduino IDE upload, `avrdude -c arduino`). The bus pin and mode are chosen at build time.
+A 3kB bootloader that updates the firmware of an ATmega328P (ATmega328P-AU / TQFP, or DIP), or a 4kB one for the ATmega2560 (Arduino Mega, see [ATmega2560](#atmega2560-arduino-mega)), over a single wire [SoftwareBitBang](/src/strategies/SoftwareBitBang/README.md) PJON bus, and also over the serial port like Optiboot (Arduino IDE upload, `avrdude -c arduino`; on the Mega like its stk500v2 bootloader, `avrdude -c wiring`). The bus pin and mode are chosen at build time.
 - **Updates:** the running application can restart the device into the bootloader with a PJON packet. If nothing arrives, the bootloader times out and starts the application again.
 - **Fresh install:** a new device, with no application and no device id, announces itself to the master. The master assigns it an id, saved in EEPROM, and flashes the application.
 - **Boot guard:** after an update, a new application that does not confirm its start within a few seconds is reset by the watchdog. The bootloader then stays active and announces the failure, so the master can flash a working application.
@@ -21,6 +21,7 @@ Firmware is sent in small chunks (32 bytes by default), and every acknowledgemen
 - [Fresh install (provisioning)](#fresh-install-provisioning)
 - [Serial upload (Arduino IDE, avrdude)](#serial-upload-arduino-ide-avrdude)
 - [Sending firmware from other PJON devices](#sending-firmware-from-other-pjon-devices)
+- [ATmega2560 (Arduino Mega)](#atmega2560-arduino-mega)
 - [Simulation tests](#simulation-tests)
 - [Limitations](#limitations)
 
@@ -187,15 +188,16 @@ make PJON_PIN=12
 
 | Option | Default | Description |
 | ------ | ------- | ----------- |
-| `PJON_PIN` | 12 | Arduino pin number of the bus, 0–19 (A0 = 14) |
+| `MCU` | atmega328p | `atmega328p` or `atmega2560` (Arduino Mega, see [ATmega2560](#atmega2560-arduino-mega)) |
+| `PJON_PIN` | 12 | Arduino pin number of the bus, 0–19 (A0 = 14); Mega: 3 by default, pins of ports A–G |
 | `DEVICE_ID` | 255 | id used when none is passed by the application or saved in EEPROM (255 = not assigned) |
 | `MODE` | 1 | SoftwareBitBang mode 1–7, must match the bus (`SWBB_MODE`). Modes 5 and 6 are faster modes, mode 7 is a different (not PJDL) link layer: every device of the bus must use the SoftwareBitBang direct port access (`SWBB_PIN`), see above |
 | `TIMEOUT_MS` | 5000 | time in the bootloader after the application requested it |
 | `EXTRF_TIMEOUT_MS` | 1000 | time in the bootloader after a reset pin reset, 0 = never |
 | `F_CPU` | 16000000 | clock frequency |
 | `CHUNK_SIZE` | 32 | bytes of flash per write packet: 16, 32, 64 or 128, same as the sender |
-| `BOOT_SIZE` | 3072 | flash used by the bootloader: 3072 (split layout, 2kB boot section) or 4096 |
-| `SERIAL_UPLOAD` | 1 | Optiboot compatible serial upload on pins 0/1 (the bus can not use them then) |
+| `BOOT_SIZE` | 3072 | flash used by the bootloader: 3072 (split layout, 2kB boot section) or 4096; Mega: 4096 (default) or 8192 |
+| `SERIAL_UPLOAD` | 1 | serial upload on pins 0/1 (the bus can not use them then): Optiboot compatible, on the Mega compatible with its stk500v2 bootloader |
 | `SERIAL_BAUD` | 115200 | serial upload baud rate |
 | `EESAVE` | 1 | 1 keeps the EEPROM content when the chip is erased |
 | `BOOT_GUARD_S` | 8 | seconds an updated application has to call `pjon_boot_app_ok()`: 0 (off), 1, 2, 4 or 8 |
@@ -225,7 +227,7 @@ The second form uses an Arduino running the ArduinoISP sketch.
 
 Override `LFUSE=` and `EFUSE=` if your board uses a different clock source.
 
-**Flashing this bootloader replaces Optiboot** (the Arduino bootloader). Afterwards the board can no longer be programmed over the serial port from the Arduino IDE; use PJON (this bootloader) or an ISP programmer.
+**Flashing this bootloader replaces Optiboot** (the Arduino bootloader). The board can still be programmed over the serial port from the Arduino IDE, see [Serial upload](#serial-upload-arduino-ide-avrdude).
 
 Pin mapping on the ATmega328P-AU (TQFP-32):
 
@@ -336,7 +338,7 @@ A server (e.g. an ESP32 behind a router) does the same: on an announcement from 
 
 ### Serial upload (Arduino IDE, avrdude)
 
-With `SERIAL_UPLOAD=1` (default) the bootloader speaks the Optiboot protocol (STK500v1) on the serial port (pins 0/1, 115200 baud):
+With `SERIAL_UPLOAD=1` (default) the bootloader speaks the Optiboot protocol (STK500v1) on the serial port (pins 0/1, 115200 baud); the ATmega2560 version speaks STK500v2 instead, like the Arduino Mega bootloader (see [ATmega2560](#atmega2560-arduino-mega)):
 - **Entering:** after a reset pin reset it listens on the serial port during `EXTRF_TIMEOUT_MS` (1s). The Arduino IDE and `avrdude -c arduino` reset the board through DTR before uploading, so the board needs the usual auto-reset circuit (DTR → 100nF → RESET), or press reset just before uploading. It also listens whenever it waits on PJON (no application, failed boot, request).
 - **Commands:** signature, page write, read back for verification, start. Pages are written and verified like PJON uploads, and writes to the bootloader are refused, so a sketch that is too large fails cleanly.
 - **Not supported:** EEPROM is not written over serial.
@@ -358,6 +360,40 @@ Any PJON device (or router) can flash a node by following the protocol above. Re
 - to receive announcements: use id 254 (`PJON_BOOT_MASTER_ID`), define `PJON_INCLUDE_PORT` and handle port 0xB007. The announcement is 19 bytes long with CRC32, sender info and port.
 
 With the default chunk size the longest packet is 48 bytes, sender info and packet id included, so it fits the default `PJON_PACKET_MAX_LENGTH` of 50 and an I2C transfer of 64 bytes. No timing setting needs to change. Chunk sizes 64 and 128 need a larger `PJON_PACKET_MAX_LENGTH` (the Uploader sketch sets it automatically).
+
+### ATmega2560 (Arduino Mega)
+
+The same source builds for the ATmega2560 (also ATmega1280) with `MCU=atmega2560`, with the same features as on the ATmega328P: application hook, reset pin entry, timeout, provisioning and announcements, boot guard, modes 1-7, and serial upload from the Arduino IDE. The differences are:
+
+| | ATmega328P | ATmega2560 |
+| - | - | - |
+| Build | `make PJON_PIN=12` | `make MCU=atmega2560` |
+| Default bus pin | 12 | 3 (PE5) |
+| Bus pins | 0-19 | pins of ports A-G: 0-5, 10-13, 18-41, 50-61 (as `SWBB_PIN`) |
+| Flash page | 128 bytes (4 chunks of 32) | 256 bytes (8 chunks of 32) |
+| Bootloader (`BOOT_SIZE`) | 3072 at 0x7400 (or 4096) | 4096 at 0x3F000 (or 8192) |
+| Size | 2942-2968 bytes | 3756-3768 bytes |
+| Fuses (`make fuses`) | high 0xD2, low 0xFF, ext 0xFD | high 0xD2, low 0xFF, ext 0xFD |
+| Write command | `W` (16 bits address) | `W` below 64kB, `X` (24 bits address) above |
+| Serial upload | Optiboot (STK500v1), `avrdude -c arduino` | Arduino Mega bootloader (STK500v2), `avrdude -c wiring` |
+| PJON uploader | `pjon_boot_upload.py` | `pjon_boot_upload.py --mcu atmega2560` |
+
+```bash
+make MCU=atmega2560 MODE=3
+make flash MCU=atmega2560 MODE=3 ISP=usbasp
+python3 tools/pjon_boot_upload.py --mcu atmega2560 --port /dev/ttyUSB0 --id 44 firmware.hex
+python3 tools/pjon_boot_upload.py --mcu atmega2560 --port /dev/ttyUSB0 --provision 45 firmware.hex
+```
+
+- The high fuse `0xD2` selects a 4kB boot section with `BOOTRST`, `SPIEN` and `EESAVE`, and leaves OCD and JTAG disabled (`0xDA` with `EESAVE=0`). `BOOT_SIZE=8192` keeps the boot section size of the Arduino Mega bootloader (0xD0 / 0xD8) and leaves 4kB unused.
+- **Arduino IDE:** keep the board *Arduino Mega or Mega 2560*. The IDE resets the board through DTR and uploads with `avrdude -c wiring` at 115200 baud, which this bootloader answers during `EXTRF_TIMEOUT_MS` after the reset (1s), and whenever it waits on PJON. Pages are written and verified, writes to the bootloader are refused, the EEPROM is not written. The IDE limit (253952 bytes) is below the space left by this bootloader (258048). Do not use *Burn Bootloader*: it would replace this bootloader with the Arduino one.
+- Command line: `avrdude -c wiring -p m2560 -P /dev/ttyACM0 -b 115200 -D -U flash:w:firmware.hex:i`.
+- Recovery: if the application does not include the hook, a reset (reset pin, `EXTRF_TIMEOUT_MS`) keeps the bootloader active for 1s; if the bootloader itself is wrong, reflash it with ISP (the 6 pin ICSP header of the Mega, `make flash ...`) - the chip erase also removes the application.
+- The application must run the SoftwareBitBang direct port access on the Mega (`#define SWBB_PIN 3`): with the portable implementation (digitalRead) Mega pin 3 does not communicate with ATmega328P devices in modes 3 and 4 (see [REVIEW-swbb-mega2560.md](/REVIEW-swbb-mega2560.md)). The bootloader itself always uses direct port access.
+- Pin 2 (PE4) is not used by the bootloader (it is left as an input without pull-up).
+- Images above 64kB: the write command `X` carries a 24 bits address (`X addrE addrH addrL data`, 36 bytes with 32 bytes chunks, a 49 bytes packet with packet id and sender info: it still fits `PJON_PACKET_MAX_LENGTH` 50). Senders other than `pjon_boot_upload.py` must use `X` for addresses from 0x10000 and 256 bytes pages (`PJON_BOOT_PAGE_SIZE`). `--sparse` writes only the pages that contain data of the image.
+- The announcement does not carry the page size: the master must know that the target is a Mega (`--mcu atmega2560`, or `PJON_BOOT_PAGE_SIZE 256` in a sender sketch) and write whole 256 bytes pages.
+- The page buffer is 256 bytes; a page write and verification takes ~9-10ms (the bootloader does not listen meanwhile, the following ping is retried by PJON as on the 328P).
 
 ### Simulation tests
 
@@ -394,6 +430,15 @@ pip install pyserial
 | `boot_guard` | an update with an application that never confirms its start: reset by the watchdog after 8s, the bootloader announces the failure, a working application is flashed and runs without further resets |
 | `serial_fresh` | fresh chip: app v1 uploaded over the serial port with avrdude (Optiboot protocol, written and verified), then updated to app v2 over PJON through the hook |
 | `serial_reset` | app v1 running, reset pin (as the Arduino IDE does with DTR), avrdude uploads an application that never calls `pjon_boot_app_ok()`: it keeps running, serial uploads do not arm the boot guard |
+| `mega_hook_upload` | ATmega2560 target (bootloader and application on Mega pin 3, application with `SWBB_PIN 3`), ATmega328P uploader on pin 2, modes 1 and 3 |
+| `mega_timeout`, `mega_fresh_chip`, `mega_interrupted` | the same as `timeout`, `fresh_chip`, `interrupted` on the ATmega2560 (mode 3) |
+| `mega_protection` | ATmega2560: bootloader section, unaligned and beyond the flash refused; far address (`X`) accepted |
+| `mega_chunks` | ATmega2560: 256 bytes page (8 chunks) above 64kB: missing, swapped, first missing, repeated chunks |
+| `mega_modes` | ATmega2560, modes 6 and 7 |
+| `mega_wake` | ATmega2560 application with `SWBB_INTERRUPT_WAKE` (INT5), mode 6 |
+| `mega_large` | ATmega2560: 80kB image (pages above 64kB written with `X`), then a sparse image with pages at 0xFF00, 0x10000, 0x20000 and 0x3EF00 (right below the bootloader), mode 7 |
+| `mega_provision` | fresh ATmega2560 announces itself, gets id 45 and app v1, then is updated to app v2 through the hook |
+| `mega_serial` | fresh ATmega2560: a 136kB image (above 128kB) uploaded over the serial port with `avrdude -c wiring` (Arduino IDE protocol, written and verified), then app v2 over PJON |
 
 `DIRECT_IO=1 ./run_tests.sh` builds the uploader and the application with `SWBB_PIN`, `ORIG_SRC=<path to a PJON src folder>` builds them with another PJON version (e.g. the one already on deployed devices), `BL_SOURCE=<path>` tests another bootloader source (e.g. the one already flashed). All tests pass with the portable implementation, with `SWBB_PIN`, with an uploader built from the previous PJON version, and the previous bootloader passes all tests (except `fast_modes`) with this library.
 
@@ -401,7 +446,7 @@ All tests pass. The simulator reports no bus contention while the target runs th
 
 ### Limitations
 
-- ATmega328P only (pin mapping, page size, fuses). The ATmega168/88 or ATmega328PB would need small changes.
+- ATmega328P and ATmega2560/1280 (pin mapping from `SoftwareBitBangAVRPins.h`, page size from avr-libc). The ATmega168/88 or ATmega328PB would need small changes (fuses, Makefile).
 - One mode, one pin, one clock frequency per build; local mode only; no shared mode bus id.
 - Modes 5 and 6 are not PJDL v5.0 modes and their bus range is unknown (see above).
 - The bootloader transmits only announcements and acknowledgements. Verification is per page; there is no read-back of the whole image.

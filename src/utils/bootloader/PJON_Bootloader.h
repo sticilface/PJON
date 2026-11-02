@@ -2,7 +2,8 @@
    ___________________________________________________________________________
 
    This header is shared by:
-   - the bootloader itself (bootloader/SoftwareBitBang/ATmega328P)
+   - the bootloader itself (bootloader/SoftwareBitBang/ATmega328P, also built
+     for the ATmega2560)
    - the application running on the target
    - the uploader / server (the device that sends the firmware over PJON)
 
@@ -30,6 +31,12 @@
                                     written and verified (~9ms, the bootloader
                                     does not listen meanwhile). A missing or
                                     out of order chunk makes the page fail.
+     'X' addrE addrH addrL data[CHUNK]
+                                 -> the same as 'W' with a 24 bits address,
+                                    for MCUs with more than 64kB of flash
+                                    (ATmega2560). Bootloaders for those MCUs
+                                    accept both 'W' (below 64kB) and 'X';
+                                    the ATmega328P bootloader only 'W'.
      'G'                         -> start the application: acknowledged only
                                     if the last page is correct
      'I' serial[4] id            -> assign a device id: accepted (and
@@ -53,6 +60,11 @@
                                     Repeated every 5s, doubling up to 60s,
                                     with random jitter; postponed by any
                                     valid command.
+
+   The flash page size depends on the target: 128 bytes (ATmega328P) or 256
+   bytes (ATmega2560). The uploader must use the target's (the bootloader
+   does not report it): tools/pjon_boot_upload.py --mcu atmega328p |
+   atmega2560, PJON_BOOT_PAGE_SIZE in an uploader sketch.
 
    Writing a page: send its chunks, then a ping. The ping is not answered
    while the page is being written (PJON retries), and is answered only if
@@ -117,6 +129,7 @@
 #define PJON_BOOT_CMD_ENTER      'B'
 #define PJON_BOOT_CMD_PING       'P'
 #define PJON_BOOT_CMD_WRITE      'W'
+#define PJON_BOOT_CMD_WRITE_FAR  'X'
 #define PJON_BOOT_CMD_GO         'G'
 #define PJON_BOOT_CMD_ASSIGN     'I'
 #define PJON_BOOT_CMD_ANNOUNCE   'b'
@@ -149,13 +162,23 @@
 #define PJON_BOOT_EEPROM_SERIAL_ADDR   (PJON_BOOT_EEPROM_ID_ADDR + 1)
 #define PJON_BOOT_FLAG_PENDING         0x5A  // new app not confirmed yet
 
-/* Flash page size of the ATmega328P in bytes */
-#define PJON_BOOT_PAGE_SIZE      128
+/* Flash page size of the target in bytes: 128 on the ATmega328P, 256 on the
+   ATmega2560. Defaults to the page size of the MCU the file is compiled for
+   (avr/io.h included before this file, as the bootloader does), else 128.
+   An uploader flashing a different MCU must define it. */
+#ifndef PJON_BOOT_PAGE_SIZE
+  #if defined(SPM_PAGESIZE)
+    #define PJON_BOOT_PAGE_SIZE  SPM_PAGESIZE
+  #else
+    #define PJON_BOOT_PAGE_SIZE  128
+  #endif
+#endif
 
 /* Bytes of flash carried by each write command: 16, 32, 64 or 128.
    Bootloader, uploader and pjon_boot_upload.py must use the same value.
-   With 32 a write packet is at most 48 bytes long (sender info, packet id,
-   port and CRC32 included) so it fits the default PJON_PACKET_MAX_LENGTH. */
+   With 32 a write packet is at most 48 bytes long, 49 with 'X' (sender
+   info, packet id, port and CRC32 included) so it fits the default
+   PJON_PACKET_MAX_LENGTH (50). */
 #ifndef PJON_BOOT_CHUNK_SIZE
   #define PJON_BOOT_CHUNK_SIZE   32
 #endif
@@ -169,6 +192,8 @@
 
 /* Length of a write command payload: command + 16 bits address + chunk */
 #define PJON_BOOT_WRITE_LENGTH   (3 + PJON_BOOT_CHUNK_SIZE)
+/* Length of a far write command payload: command + 24 bits address + chunk */
+#define PJON_BOOT_WRITE_FAR_LENGTH (4 + PJON_BOOT_CHUNK_SIZE)
 
 /* Worst case PJON overhead of a packet sent to the bootloader: id, header,
    length, CRC8, sender id, packet id (2), port (2), CRC32 (4) */

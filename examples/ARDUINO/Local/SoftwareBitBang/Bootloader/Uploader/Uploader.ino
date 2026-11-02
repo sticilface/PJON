@@ -24,7 +24,8 @@
 
    The bootloader acknowledges every packet quickly (pages are confirmed by
    a ping sent after them), so default PJON settings work: with the default
-   chunk size of 32 bytes the longest packet is 48 bytes. Only a chunk size
+   chunk size of 32 bytes the longest packet is 48 bytes (49 with the 24 bits
+   address of an ATmega2560 target). Only a chunk size
    of 64 or 128 (PJON_BOOT_CHUNK_SIZE, must match the bootloader) needs a
    longer packet buffer, set below. Optionally define PJON_INCLUDE_PACKET_ID
    to send packet ids, the bootloader accepts packets with or without. */
@@ -33,7 +34,7 @@
 
 #if PJON_BOOT_CHUNK_SIZE > 32 && !defined(PJON_PACKET_MAX_LENGTH)
   #define PJON_PACKET_MAX_LENGTH \
-    (PJON_BOOT_MAX_OVERHEAD + PJON_BOOT_WRITE_LENGTH + 1)
+    (PJON_BOOT_MAX_OVERHEAD + PJON_BOOT_WRITE_FAR_LENGTH + 1)
 #endif
 // Packets are sent with send_packet_blocking, no buffered packets needed
 #define PJON_MAX_PACKETS 1
@@ -48,7 +49,8 @@
 
 PJONSoftwareBitBang bus(PJON_BOOT_MASTER_ID);
 
-uint8_t request[2 + PJON_BOOT_WRITE_LENGTH];
+// The longest payload is a far write ('X', 24 bits address, ATmega2560)
+uint8_t request[2 + PJON_BOOT_WRITE_FAR_LENGTH];
 uint16_t received = 0;
 uint32_t last_byte_time = 0;
 uint16_t packet_id = 1;
@@ -84,7 +86,7 @@ void loop() {
       received = 0;
     last_byte_time = millis();
     request[received++] = Serial.read();
-    if(received == 2 && request[1] > PJON_BOOT_WRITE_LENGTH) {
+    if(received == 2 && request[1] > PJON_BOOT_WRITE_FAR_LENGTH) {
       received = 0;
       Serial.write('E');
       continue;

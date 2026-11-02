@@ -1,4 +1,5 @@
-/* Simulation of ATmega328P devices connected by a single wire PJON bus.
+/* Simulation of AVR devices connected by a single wire PJON bus: targets
+   are ATmega328P (or ATmega2560 with -M), the uploader an ATmega328P.
 
    targets:  PJON SoftwareBitBang bootloader + optional application (1 to 4)
    uploader: Uploader sketch, its USART0 is exposed as a pty
@@ -21,6 +22,8 @@
      -A address  EEPROM address of the device id (default 1019), the serial
                  follows it
      -B pin      bus pin, Arduino numbering (default 12)
+     -P pin      bus pin of the targets if different (e.g. 3 on a Mega)
+     -M mcu      target MCU: atmega328p (default) or atmega2560
      -F hz       target clock frequency (default 16000000)
      -m value    exit with success when all targets wrote value in GPIOR1
      -w seconds  ignore GPIOR1 changes before this simulated time
@@ -49,28 +52,71 @@
 #include <simavr/parts/uart_pty.h>
 #include <simavr/avr_ioport.h>
 
-#define MCU "atmega328p"
+#define UPLOADER_MCU "atmega328p"
 #define UPLOADER_FREQUENCY 16000000
+/* Same addresses on the ATmega328P and the ATmega2560 */
 #define GPIOR1_ADDR 0x4A
 #define MCUSR_ADDR  0x54
-#define RAMEND 0x8FF
-#define EEPROM_SIZE 1024
 #define MAX_TARGETS 4
+static int ramend = 0x8FF, eeprom_size = 1024; // of the targets
+
+/* Bus pin of a core: data space addresses of PINx, DDRx, PORTx and mask */
+typedef struct {
+  int pin_reg, ddr_reg, port_reg, mask;
+  avr_irq_t *irq; // bus pin input, raised so external interrupts fire
+} bus_io_t;
+
+/* Arduino pin number -> port letter and bit, -1 if unknown */
+static int map_pin(const char *mcu, int pin, char *port, int *bit) {
+  if(!strcmp(mcu, "atmega2560")) {
+    /* Arduino Mega variant (pins_arduino.h of the Arduino AVR core) */
+    static const char ports[] =
+      "EEEEGEHHHHBBBBJJHHDDDDAAAAAAAACCCCCCCCDGGGLLLLLLLLBBBBFFFFFFFFKKKKKKKK";
+    static const int bits[] = {
+      0,1,4,5,5,3,3,4,5,6,4,5,6,7,1,0,1,0,3,2,1,0,0,1,2,3,4,5,6,7,
+      7,6,5,4,3,2,1,0,7,2,1,0,7,6,5,4,3,2,1,0,3,2,1,0,
+      0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7};
+    if(pin < 0 || pin > 69) return -1;
+    *port = ports[pin]; *bit = bits[pin]; return 0;
+  }
+  if(pin < 0 || pin > 19) return -1;
+  if(pin <= 7) { *port = 'D'; *bit = pin; }
+  else if(pin <= 13) { *port = 'B'; *bit = pin - 8; }
+  else { *port = 'C'; *bit = pin - 14; }
+  return 0;
+}
+
+static int bus_io(avr_t *avr, const char *mcu, int pin, bus_io_t *io) {
+  char port;
+  int bit;
+  if(map_pin(mcu, pin, &port, &bit)) {
+    fprintf(stderr, "sim: unknown pin %d on %s\n", pin, mcu);
+    return -1;
+  }
+  const char *p = strchr("ABCDEFG", port);
+  io->pin_reg = p ? 0x20 + 3 * (int)(p - "ABCDEFG") :
+    0x100 + 3 * (int)(strchr("HJKL", port) - "HJKL");
+  io->ddr_reg = io->pin_reg + 1;
+  io->port_reg = io->pin_reg + 2;
+  io->mask = 1 << bit;
+  io->irq = avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ(port), bit);
+  return 0;
+}
 
 typedef struct {
   avr_t *avr;
+  bus_io_t io;
   uint8_t mailbox[3];
   uint32_t last_pc;
   int in_boot;
   int marker;
-  avr_irq_t *pin_irq; // bus pin input, raised so external interrupts fire
 } target_t;
 
 static target_t targets[MAX_TARGETS];
 static int target_count = 1;
 static avr_t *uploader;
 static uart_pty_t pty, target_pty;
-static int pin_reg, ddr_reg, port_reg, mask;
+static bus_io_t uploader_io;
 static uint32_t boot_start, reset_address;
 
 /* Loads an Intel HEX file (all its chunks) in flash, returns its lowest
@@ -95,27 +141,27 @@ static uint32_t load(avr_t *avr, const char *path, int verbose) {
 }
 
 static uint8_t *eeprom(avr_t *avr) {
-  avr_eeprom_desc_t desc = { .ee = NULL, .offset = 0, .size = EEPROM_SIZE };
+  avr_eeprom_desc_t desc = { .ee = NULL, .offset = 0, .size = 1024 };
   avr_ioctl(avr, AVR_IOCTL_EEPROM_GET, &desc);
   return desc.ee;
 }
 
-static int drives_high(avr_t *avr) {
-  return (avr->data[ddr_reg] & mask) && (avr->data[port_reg] & mask);
+static int drives_high(avr_t *avr, const bus_io_t *io) {
+  return (avr->data[io->ddr_reg] & io->mask) &&
+    (avr->data[io->port_reg] & io->mask);
 }
 
-static int drives_low(avr_t *avr) {
-  return (avr->data[ddr_reg] & mask) && !(avr->data[port_reg] & mask);
+static int drives_low(avr_t *avr, const bus_io_t *io) {
+  return (avr->data[io->ddr_reg] & io->mask) &&
+    !(avr->data[io->port_reg] & io->mask);
 }
-
-static avr_irq_t *pin_irq_uploader;
 
 /* Sets the bus level seen by a core: through the port pin IRQ, so that pin
    change and external interrupts (INT0/INT1) are triggered */
-static void set_input(avr_t *avr, avr_irq_t *irq, int level) {
-  if(irq->value != (uint32_t)level) avr_raise_irq(irq, level);
-  if(level) avr->data[pin_reg] |= mask;
-  else avr->data[pin_reg] &= ~mask;
+static void set_input(avr_t *avr, const bus_io_t *io, int level) {
+  if(io->irq->value != (uint32_t)level) avr_raise_irq(io->irq, level);
+  if(level) avr->data[io->pin_reg] |= io->mask;
+  else avr->data[io->pin_reg] &= ~io->mask;
 }
 
 static double us(avr_t *avr) {
@@ -134,13 +180,14 @@ int main(int argc, char **argv) {
   const char *boot = NULL, *app = NULL, *up = NULL, *dump = NULL;
   const char *eeprom_dump = NULL, *serials[MAX_TARGETS] = {0};
   int ids[MAX_TARGETS] = {0}, serial_count = 0, id_count = 0;
-  int bus_pin = 12, marker = -1, use_pty = 1, trace = 0, opt;
+  int bus_pin = 12, target_pin = -1, marker = -1, use_pty = 1, trace = 0, opt;
   int target_serial = 0, reset_flags = 1;
   long reset_option = -1;
+  const char *target_mcu = "atmega328p";
   int id_address = 1019;
   double max_seconds = 60, marker_after = 0;
   uint32_t target_frequency = 16000000;
-  while((opt = getopt(argc, argv, "b:a:u:N:s:i:A:B:F:m:w:t:f:E:R:SXen")) != -1) {
+  while((opt = getopt(argc, argv, "b:a:u:N:s:i:A:B:P:M:F:m:w:t:f:E:R:SXen")) != -1) {
     switch(opt) {
       case 'b': boot = optarg; break;
       case 'a': app = optarg; break;
@@ -150,6 +197,8 @@ int main(int argc, char **argv) {
       case 'i': if(id_count < MAX_TARGETS) ids[id_count++] = atoi(optarg); break;
       case 'A': id_address = atoi(optarg); break;
       case 'B': bus_pin = atoi(optarg); break;
+      case 'P': target_pin = atoi(optarg); break;
+      case 'M': target_mcu = optarg; break;
       case 'F': target_frequency = atol(optarg); break;
       case 'm': marker = strtol(optarg, NULL, 0); break;
       case 'w': marker_after = atof(optarg); break;
@@ -170,18 +219,18 @@ int main(int argc, char **argv) {
   }
   setvbuf(stdout, NULL, _IONBF, 0);
 
-  /* Arduino pin -> data space addresses of PINx, DDRx, PORTx */
-  if(bus_pin <= 7) { pin_reg = 0x29; mask = 1 << bus_pin; }
-  else if(bus_pin <= 13) { pin_reg = 0x23; mask = 1 << (bus_pin - 8); }
-  else { pin_reg = 0x26; mask = 1 << (bus_pin - 14); }
-  ddr_reg = pin_reg + 1;
-  port_reg = pin_reg + 2;
+  if(target_pin < 0) target_pin = bus_pin;
+  if(!strcmp(target_mcu, "atmega2560")) {
+    ramend = 0x21FF;
+    eeprom_size = 4096;
+  }
 
   for(int n = 0; n < target_count; n++) {
     target_t *t = &targets[n];
-    t->avr = avr_make_mcu_by_name(MCU);
+    t->avr = avr_make_mcu_by_name(target_mcu);
     if(!t->avr) return 2;
     avr_init(t->avr);
+    if(bus_io(t->avr, target_mcu, target_pin, &t->io)) return 2;
     t->avr->frequency = target_frequency;
     t->avr->log = LOG_WARNING;
     /* simavr sleeps (in real time) when the firmware polls an empty UART,
@@ -200,7 +249,7 @@ int main(int argc, char **argv) {
     t->last_pc = reset_address;
     t->in_boot = 1;
     uint8_t *ee = eeprom(t->avr);
-    memset(ee, 0xFF, EEPROM_SIZE);
+    memset(ee, 0xFF, eeprom_size);
     if(n < id_count) ee[id_address] = ids[n];
     if(n < serial_count)
       for(int i = 0; i < 4; i++) {
@@ -209,19 +258,10 @@ int main(int argc, char **argv) {
         ee[id_address + 1 + i] = b;
       }
   }
-  uploader = avr_make_mcu_by_name(MCU);
+  uploader = avr_make_mcu_by_name(UPLOADER_MCU);
   if(!uploader) return 2;
   avr_init(uploader);
-  {
-    char port = (bus_pin <= 7) ? 'D' : ((bus_pin <= 13) ? 'B' : 'C');
-    int bit = (bus_pin <= 7) ? bus_pin :
-      ((bus_pin <= 13) ? bus_pin - 8 : bus_pin - 14);
-    for(int n = 0; n < target_count; n++)
-      targets[n].pin_irq =
-        avr_io_getirq(targets[n].avr, AVR_IOCTL_IOPORT_GETIRQ(port), bit);
-    pin_irq_uploader =
-      avr_io_getirq(uploader, AVR_IOCTL_IOPORT_GETIRQ(port), bit);
-  }
+  if(bus_io(uploader, UPLOADER_MCU, bus_pin, &uploader_io)) return 2;
   uploader->frequency = UPLOADER_FREQUENCY;
   uploader->log = LOG_WARNING;
   load(uploader, up, 1);
@@ -266,7 +306,7 @@ int main(int argc, char **argv) {
       uint32_t pc = avr->pc;
       /* A reset is the only way into the bootloader entry point */
       if(pc == reset_address && current->last_pc != reset_address) {
-        uint8_t *ram = avr->data + RAMEND - 2;
+        uint8_t *ram = avr->data + ramend - 2;
         printf("sim: %.3fs target reset, MCUSR=0x%02X%s\n",
           us(avr) / 1e6, avr->data[MCUSR_ADDR], tag(n));
         /* Real hardware keeps SRAM content on a watchdog reset */
@@ -275,7 +315,7 @@ int main(int argc, char **argv) {
           memcpy(ram, current->mailbox, 3);
         }
       }
-      memcpy(current->mailbox, avr->data + RAMEND - 2, 3);
+      memcpy(current->mailbox, avr->data + ramend - 2, 3);
       if((pc < boot_start) == current->in_boot) {
         current->in_boot = !current->in_boot;
         printf("sim: %.3fs target running %s (pc 0x%04X)%s\n", us(avr) / 1e6,
@@ -298,14 +338,15 @@ int main(int argc, char **argv) {
     }
 
     /* Wired bus */
-    int high = drives_high(uploader), low = drives_low(uploader);
+    int high = drives_high(uploader, &uploader_io);
+    int low = drives_low(uploader, &uploader_io);
     int high_in_boot = 0;
     for(int n = 0; n < target_count; n++) {
-      if(drives_high(targets[n].avr)) {
+      if(drives_high(targets[n].avr, &targets[n].io)) {
         high = 1;
         high_in_boot |= targets[n].in_boot;
       }
-      if(drives_low(targets[n].avr)) low = 1;
+      if(drives_low(targets[n].avr, &targets[n].io)) low = 1;
     }
     if(high && low) {
       if(!contention_now) {
@@ -318,12 +359,12 @@ int main(int argc, char **argv) {
       contention_now = 1;
     } else contention_now = 0;
     for(int n = 0; n < target_count; n++)
-      set_input(targets[n].avr, targets[n].pin_irq, high);
-    set_input(uploader, pin_irq_uploader, high);
+      set_input(targets[n].avr, &targets[n].io, high);
+    set_input(uploader, &uploader_io, high);
     if(trace && high != last_level) {
       fprintf(stderr, "%.2f %d %c%c\n", us(avr), high,
-        (high && !drives_high(uploader)) ? 'T' : '-',
-        drives_high(uploader) ? 'U' : '-');
+        (high && !drives_high(uploader, &uploader_io)) ? 'T' : '-',
+        drives_high(uploader, &uploader_io) ? 'U' : '-');
     }
     (void)high_in_boot;
     last_level = high;
@@ -350,7 +391,7 @@ int main(int argc, char **argv) {
       snprintf(path, sizeof(path), "%s%d.bin", eeprom_dump, n);
       FILE *f = fopen(path, "wb");
       if(f) {
-        fwrite(eeprom(targets[n].avr), 1, EEPROM_SIZE, f);
+        fwrite(eeprom(targets[n].avr), 1, 1024, f);
         fclose(f);
       }
     }

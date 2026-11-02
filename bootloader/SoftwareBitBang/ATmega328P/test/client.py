@@ -13,7 +13,13 @@
                                        SERIAL, EXPECTED 1 if it must be accepted
     client.py check HEX FLASH_BIN      compare a HEX file with a flash dump
     client.py eeprom EEPROM_BIN ID     check that the EEPROM dump holds device ID
-    client.py large HEX OUT_HEX        HEX followed by pseudo random data up to the bootloader
+    client.py large HEX OUT_HEX [END]  HEX followed by pseudo random data up to the bootloader
+                                       (or up to END)
+    client.py far HEX OUT_HEX          HEX plus pseudo random pages above 64kB, above 128kB
+                                       and right below the bootloader (sparse image)
+
+The target MCU is taken from PJON_BOOT_MCU (atmega328p by default, or
+atmega2560): page size, bootloader start and protected addresses.
 """
 
 import importlib.util
@@ -27,7 +33,9 @@ spec = importlib.util.spec_from_file_location(
 up = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(up)
 
-BOOT_START = 0x7400
+MCU = os.environ.get("PJON_BOOT_MCU", "atmega328p")
+BOOT_START = up.MCUS[MCU]["boot_start"]
+PAGE_SIZE = up.MCUS[MCU]["page_size"]
 EEPROM_ID_ADDR = 1019
 CHUNK = 32
 
@@ -39,8 +47,7 @@ def connect(port):
 
 
 def chunk(uploader, device_id, address, data):
-    return uploader.send(
-        device_id, up.CMD_WRITE + bytes([address >> 8, address & 0xFF]) + data)
+    return uploader.send(device_id, up.write_command(address, data))
 
 
 def page(uploader, device_id, address, data):
@@ -61,10 +68,10 @@ def cmd_partial(port, device_id, hex_path, count):
     device_id = int(device_id)
     uploader = connect(port)
     enter(uploader, device_id)
-    pages = up.build_pages(up.parse_hex(hex_path), BOOT_START)
+    pages = up.build_pages(up.parse_hex(hex_path), BOOT_START, PAGE_SIZE)
     if not uploader.send(device_id, up.CMD_PING):
         sys.exit("ping: not acknowledged")
-    if not page(uploader, device_id, 0, b"\xFF" * up.PAGE_SIZE):
+    if not page(uploader, device_id, 0, b"\xFF" * PAGE_SIZE):
         sys.exit("invalidate page 0: not acknowledged")
     for address, data in pages[1:1 + int(count)]:
         if not page(uploader, device_id, address, data):
@@ -79,12 +86,18 @@ def cmd_partial(port, device_id, hex_path, count):
 def cmd_protect(port, device_id):
     device_id = int(device_id)
     uploader = connect(port)
+    end = 0x8000 if MCU == "atmega328p" else 0x40000  # end of the flash
     checks = [  # chunk address, expected acknowledgement
-        (0x73E0, True),    # last chunk of the application area
-        (0x7400, False),   # first chunk of the bootloader
-        (0x7FE0, False),   # last chunk of the bootloader
-        (0x0010, False),   # not aligned to a chunk
+        (BOOT_START - CHUNK, True),   # last chunk of the application area
+        (BOOT_START, False),          # first chunk of the bootloader
+        (end - CHUNK, False),         # last chunk of the bootloader
+        (0x0010, False),              # not aligned to a chunk
     ]
+    if MCU == "atmega2560":
+        checks += [
+            (0x1FFE0, True),          # far address ('X')
+            (0x400000 - CHUNK, False),  # beyond the flash
+        ]
     failed = 0
     for address, expected in checks:
         acked = chunk(uploader, device_id, address, b"\x00" * CHUNK)
@@ -98,14 +111,17 @@ def cmd_protect(port, device_id):
 def cmd_chunks(port, device_id):
     device_id = int(device_id)
     uploader = connect(port)
-    data = bytes(range(128))
-    base = 0x1000
+    data = bytes(i & 0xFF for i in range(PAGE_SIZE))
+    base = 0x1000 if MCU == "atmega328p" else 0x12000  # far page on the Mega
+    n = PAGE_SIZE // CHUNK
+    last = n - 1
     sequences = [  # chunk indexes sent, then the ping must be acknowledged?
-        ("all chunks in order", [0, 1, 2, 3], True),
-        ("chunk 2 missing", [0, 1, 3], False),
-        ("chunks 1 and 2 swapped", [0, 2, 1, 3], False),
-        ("first chunk missing", [1, 2, 3], False),
-        ("chunk repeated (lost acknowledgement)", [0, 1, 1, 2, 3, 3], True),
+        ("all chunks in order", list(range(n)), True),
+        ("chunk 2 missing", [i for i in range(n) if i != 2], False),
+        ("chunks 1 and 2 swapped", [0, 2, 1] + list(range(3, n)), False),
+        ("first chunk missing", list(range(1, n)), False),
+        ("chunk repeated (lost acknowledgement)",
+         [0, 1, 1] + list(range(2, n)) + [last], True),
     ]
     failed = 0
     for name, indexes, expected in sequences:
@@ -147,26 +163,51 @@ def cmd_check(hex_path, flash_path):
     sys.exit(1 if bad else 0)
 
 
-def cmd_large(hex_path, out_path):
-    data = up.parse_hex(hex_path)
-    random.seed(1)
-    for address in range(max(data) + 1, BOOT_START):
-        data[address] = random.randrange(256)
+def write_hex(data, out_path):
+    """Intel HEX with extended linear address records above 64kB"""
     with open(out_path, "w") as out:
-        for address in range(0, BOOT_START, 16):
-            record = [16, address >> 8, address & 0xFF, 0] + \
+        segment = 0
+        for address in range(0, max(data) + 1, 16):
+            if not any((address + i) in data for i in range(16)):
+                continue
+            if address >> 16 != segment:
+                segment = address >> 16
+                record = [2, 0, 0, 4, segment >> 8, segment & 0xFF]
+                record.append(-sum(record) & 0xFF)
+                out.write(":" + "".join("%02X" % b for b in record) + "\n")
+            record = [16, (address >> 8) & 0xFF, address & 0xFF, 0] + \
                 [data.get(address + i, 0xFF) for i in range(16)]
             record.append(-sum(record) & 0xFF)
             out.write(":" + "".join("%02X" % b for b in record) + "\n")
         out.write(":00000001FF\n")
-    print("large image: %d bytes" % BOOT_START)
+
+
+def cmd_large(hex_path, out_path, end=None):
+    end = int(end, 0) if end else BOOT_START
+    data = up.parse_hex(hex_path)
+    random.seed(1)
+    for address in range(max(data) + 1, end):
+        data[address] = random.randrange(256)
+    write_hex(data, out_path)
+    print("large image: %d bytes" % end)
+
+
+def cmd_far(hex_path, out_path):
+    data = up.parse_hex(hex_path)
+    random.seed(2)
+    starts = [0x10000 - PAGE_SIZE, 0x10000, 0x20000, BOOT_START - PAGE_SIZE]
+    for start in starts:
+        for address in range(start, start + PAGE_SIZE):
+            data[address] = random.randrange(256)
+    write_hex(data, out_path)
+    print("far image: pages at %s" % ", ".join("0x%05X" % s for s in starts))
 
 
 if __name__ == "__main__":
     commands = {
         "enter": cmd_enter, "partial": cmd_partial, "protect": cmd_protect,
         "chunks": cmd_chunks, "assign": cmd_assign, "eeprom": cmd_eeprom,
-        "check": cmd_check, "large": cmd_large,
+        "check": cmd_check, "large": cmd_large, "far": cmd_far,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
         sys.exit(__doc__)

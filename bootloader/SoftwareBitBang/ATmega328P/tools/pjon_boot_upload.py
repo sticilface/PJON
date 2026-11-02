@@ -8,6 +8,8 @@ firmware over the PJON bus to the target.
     python3 pjon_boot_upload.py --port /dev/ttyUSB0 --id 44 firmware.hex
     python3 pjon_boot_upload.py --port /dev/ttyUSB0 --provision 45 firmware.hex
     python3 pjon_boot_upload.py --port /dev/ttyUSB0 --listen
+    python3 pjon_boot_upload.py --mcu atmega2560 --port /dev/ttyUSB0 \
+        --id 44 firmware.hex                              (Arduino Mega)
 
 --id: update a device. Sequence:
  1. ask the running application to restart into the bootloader ('B')
@@ -15,7 +17,8 @@ firmware over the PJON bus to the target.
  3. erase page 0 first, so an interrupted upload leaves a device that stays
     in the bootloader instead of running a half written application
  4. write every other page, then page 0 last. A page is sent as chunks
-    ('W', --chunk-size bytes each, must match the bootloader build) followed
+    ('W', --chunk-size bytes each, must match the bootloader build; 'X' with
+    a 24 bits address above 64kB on the ATmega2560) followed
     by a ping, acknowledged only once the page is written and verified; if
     it is not, the page is sent again
  5. start the new application ('G')
@@ -38,16 +41,34 @@ try:
 except ImportError:
     sys.exit("pyserial is required: pip install pyserial")
 
-PAGE_SIZE = 128
+PAGE_SIZE = 128  # ATmega328P, see MCUS
 CMD_ENTER = b"B"
 CMD_PING = b"P"
 CMD_WRITE = b"W"
+CMD_WRITE_FAR = b"X"
 CMD_GO = b"G"
 CMD_ASSIGN = b"I"
 CMD_ANNOUNCE = ord("b")
 UNASSIGNED = 255
 REASONS = {1: "no application", 2: "application did not start (boot guard)",
            3: "entered on request"}
+
+# Target MCUs: flash page size and default bootloader start (default
+# BOOT_SIZE of the Makefile: 3072 on the atmega328p, 4096 on the atmega2560)
+MCUS = {
+    "atmega328p": {"page_size": 128, "boot_start": 0x7400},
+    "atmega2560": {"page_size": 256, "boot_start": 0x3F000},
+}
+
+
+def write_command(address, data):
+    """Write command of a chunk: 'W' with a 16 bits address, 'X' with a 24
+    bits address above 64kB (only bootloaders of MCUs with more than 64kB of
+    flash accept it)."""
+    if address > 0xFFFF:
+        return CMD_WRITE_FAR + bytes(
+            [address >> 16, (address >> 8) & 0xFF, address & 0xFF]) + data
+    return CMD_WRITE + bytes([address >> 8, address & 0xFF]) + data
 
 
 def parse_hex(path):
@@ -81,7 +102,9 @@ def parse_hex(path):
     return data
 
 
-def build_pages(data, boot_start=0x7400):
+def build_pages(data, boot_start=0x7400, page_size=PAGE_SIZE, sparse=False):
+    """Pages from address 0 to the end of the image. With sparse, only the
+    pages that contain data of the image (the others keep their content)."""
     if not data:
         raise ValueError("the HEX file is empty")
     end = max(data) + 1
@@ -89,9 +112,12 @@ def build_pages(data, boot_start=0x7400):
         raise ValueError(
             "the image ends at 0x%04X, it overlaps the bootloader at 0x%04X"
             % (end, boot_start))
+    used = {address - address % page_size for address in data}
     pages = []
-    for address in range(0, end, PAGE_SIZE):
-        page = bytes(data.get(address + i, 0xFF) for i in range(PAGE_SIZE))
+    for address in range(0, end, page_size):
+        if sparse and address and address not in used:
+            continue
+        page = bytes(data.get(address + i, 0xFF) for i in range(page_size))
         pages.append((address, page))
     return pages
 
@@ -99,10 +125,10 @@ def build_pages(data, boot_start=0x7400):
 def write_page(up, device_id, address, page, chunk_size):
     """Sends the chunks of a page, then a ping that is acknowledged only if
     the page was written and verified. Returns True if it was."""
-    for offset in range(0, PAGE_SIZE, chunk_size):
-        chunk_address = address + offset
-        command = CMD_WRITE + bytes([chunk_address >> 8, chunk_address & 0xFF])
-        if not up.send(device_id, command + page[offset:offset + chunk_size]):
+    for offset in range(0, len(page), chunk_size):
+        command = write_command(
+            address + offset, page[offset:offset + chunk_size])
+        if not up.send(device_id, command):
             return False
     return up.send(device_id, CMD_PING)
 
@@ -213,9 +239,17 @@ def main():
                         help="seconds to wait for an announcement (default 120, "
                              "with --listen: 0 = forever)")
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--boot-start", type=lambda v: int(v, 0), default=0x7400,
-                        help="bootloader start address: 0x7400 for the default "
-                             "3kB layout, 0x7000 for BOOT_SIZE=4096")
+    parser.add_argument("--mcu", default="atmega328p", choices=sorted(MCUS),
+                        help="target MCU: flash page size and default "
+                             "--boot-start (default atmega328p)")
+    parser.add_argument("--boot-start", type=lambda v: int(v, 0), default=None,
+                        help="bootloader start address (default: 0x7400 on "
+                             "the atmega328p, 3kB layout, 0x7000 for "
+                             "BOOT_SIZE=4096; 0x3F000 on the atmega2560, "
+                             "0x3E000 for BOOT_SIZE=8192)")
+    parser.add_argument("--sparse", action="store_true",
+                        help="write only the pages that contain data of the "
+                             "image (the others keep their content)")
     parser.add_argument("--chunk-size", type=int, default=32,
                         choices=[16, 32, 64, 128],
                         help="bytes per write packet, as CHUNK_SIZE of the "
@@ -248,8 +282,12 @@ def main():
     target = args.provision if args.provision is not None else args.id
     if not 1 <= target <= 253:
         sys.exit("the device id must be between 1 and 253")
-    pages = build_pages(parse_hex(args.hex), args.boot_start)
-    print("%s: %d bytes, %d pages" % (args.hex, len(pages) * PAGE_SIZE, len(pages)))
+    page_size = MCUS[args.mcu]["page_size"]
+    boot_start = args.boot_start
+    if boot_start is None:
+        boot_start = MCUS[args.mcu]["boot_start"]
+    pages = build_pages(parse_hex(args.hex), boot_start, page_size, args.sparse)
+    print("%s: %d bytes, %d pages" % (args.hex, len(pages) * page_size, len(pages)))
 
     up = Uploader(args.port, args.baud, args.reply_timeout)
     up.handshake()
@@ -293,10 +331,10 @@ def main():
         for _ in range(args.write_attempts):
             if write_page(up, target, address, page, args.chunk_size):
                 return
-        sys.exit("\nwriting page 0x%04X failed (is --chunk-size the same as "
-                 "the bootloader's CHUNK_SIZE?)" % address)
+        sys.exit("\nwriting page 0x%04X failed (are --chunk-size and --mcu "
+                 "the same as the bootloader's?)" % address)
 
-    write(0, b"\xFF" * PAGE_SIZE)  # invalidate the application first
+    write(0, b"\xFF" * page_size)  # invalidate the application first
     order = pages[1:] + pages[:1]  # page 0 (reset vector) last
     start = time.time()
     for n, (address, page) in enumerate(order, 1):
