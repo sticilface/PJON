@@ -41,6 +41,25 @@ void setup() {
   bus.begin();
   delay(20); // let the bootloader start
 }
+#ifdef ANNOUNCE
+/* -DANNOUNCE=<ms>: only listen for ANNOUNCE ms and count the announcements
+   of the bootloader (fresh device without application) received and
+   acknowledged by PJON */
+static uint16_t announcements = 0;
+static void receiver(uint8_t *payload, uint16_t length,
+  const PJON_Packet_Info &info) {
+  if((info.port == PJON_BOOT_PORT) && (length == PJON_BOOT_ANNOUNCE_LENGTH)
+    && (payload[0] == PJON_BOOT_CMD_ANNOUNCE)) announcements++;
+}
+void loop() {
+  bus.set_receiver(receiver);
+  uint32_t start = millis();
+  while(millis() - start < ANNOUNCE) bus.receive(1000);
+  Serial.print("DONE announcements "); print_number(announcements);
+  Serial.println("");
+  for(;;);
+}
+#else
 void loop() {
   uint16_t ok = 0, fail = 0;
   uint8_t payload[PJON_BOOT_WRITE_LENGTH];
@@ -65,3 +84,4 @@ void loop() {
   Serial.println("");
   for(;;);
 }
+#endif

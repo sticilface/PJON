@@ -115,11 +115,13 @@ static char line[NMAX][256];
 static int line_len[NMAX], done[NMAX], stamp = 0;
 
 static void load(avr_t *avr, const char *path) {
-  uint32_t size = 0, start = 0;
-  uint8_t *data = read_ihex_file(path, &size, &start);
-  if(!data) { fprintf(stderr, "can not read %s\n", path); exit(2); }
-  memcpy(avr->flash + start, data, size);
-  free(data);
+  /* every chunk: a bootloader with the split layout has two */
+  ihex_chunk_p chunks = NULL;
+  int count = read_ihex_chunks(path, &chunks);
+  if(count <= 0) { fprintf(stderr, "can not read %s\n", path); exit(2); }
+  for(int i = 0; i < count; i++)
+    memcpy(avr->flash + chunks[i].baseaddr, chunks[i].data, chunks[i].size);
+  free_ihex_chunks(chunks);
 }
 
 static double us(avr_t *avr) {

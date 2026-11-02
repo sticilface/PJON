@@ -4,3 +4,4 @@
 test/build/
 __pycache__/
 test/swbb/build/
+serial.eep

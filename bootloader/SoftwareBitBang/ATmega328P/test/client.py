@@ -8,7 +8,11 @@
                                        valid chunk addresses are accepted
     client.py chunks PORT ID           bootloader already active: check that missing,
                                        out of order and repeated chunks are handled
+    client.py assign PORT SERIAL ID EXPECTED
+                                       assign ID to the unprovisioned device with
+                                       SERIAL, EXPECTED 1 if it must be accepted
     client.py check HEX FLASH_BIN      compare a HEX file with a flash dump
+    client.py eeprom EEPROM_BIN ID     check that the EEPROM dump holds device ID
     client.py large HEX OUT_HEX        HEX followed by pseudo random data up to the bootloader
 """
 
@@ -23,7 +27,8 @@ spec = importlib.util.spec_from_file_location(
 up = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(up)
 
-BOOT_START = 0x7800
+BOOT_START = 0x7400
+EEPROM_ID_ADDR = 1019
 CHUNK = 32
 
 
@@ -75,8 +80,8 @@ def cmd_protect(port, device_id):
     device_id = int(device_id)
     uploader = connect(port)
     checks = [  # chunk address, expected acknowledgement
-        (0x77E0, True),    # last chunk of the application area
-        (0x7800, False),   # first chunk of the bootloader
+        (0x73E0, True),    # last chunk of the application area
+        (0x7400, False),   # first chunk of the bootloader
         (0x7FE0, False),   # last chunk of the bootloader
         (0x0010, False),   # not aligned to a chunk
     ]
@@ -117,6 +122,23 @@ def cmd_chunks(port, device_id):
     sys.exit(1 if failed else 0)
 
 
+def cmd_assign(port, serial_hex, device_id, expected):
+    acked = up.assign(connect(port), serial_hex, int(device_id))
+    ok = acked == (expected == "1")
+    print("assign id %s to serial %s: %s (%s)" % (
+        device_id, serial_hex, "accepted" if acked else "refused",
+        "ok" if ok else "WRONG"))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_eeprom(eeprom_path, device_id):
+    data = open(eeprom_path, "rb").read()
+    found = data[EEPROM_ID_ADDR]
+    serial = data[EEPROM_ID_ADDR + 1:EEPROM_ID_ADDR + 5].hex()
+    print("EEPROM: device id %d, serial %s" % (found, serial))
+    sys.exit(0 if found == int(device_id) else 1)
+
+
 def cmd_check(hex_path, flash_path):
     data = up.parse_hex(hex_path)
     flash = open(flash_path, "rb").read()
@@ -143,7 +165,8 @@ def cmd_large(hex_path, out_path):
 if __name__ == "__main__":
     commands = {
         "enter": cmd_enter, "partial": cmd_partial, "protect": cmd_protect,
-        "chunks": cmd_chunks, "check": cmd_check, "large": cmd_large,
+        "chunks": cmd_chunks, "assign": cmd_assign, "eeprom": cmd_eeprom,
+        "check": cmd_check, "large": cmd_large,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
         sys.exit(__doc__)
