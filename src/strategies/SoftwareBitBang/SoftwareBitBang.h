@@ -115,14 +115,26 @@
    - the reception of a frame by the interrupt of SWBB_INTERRUPT_WAKE (and
      mode 7 with SWBB_INTERRUPT_WAKE), from its first rising edge until the
      frame is stored and acknowledged, or discarded;
-   - send_frame, receive_response and send_response of SWBB_PIN (polling
-     reception, frame by frame through bus.receive(), is not covered).
+   - send_frame, receive_response and send_response of SWBB_PIN;
+   - polling reception with SWBB_PIN: begin when a frame initializer is
+     recognised (and the first byte received), end when as many bytes as
+     the frame's length field have been received or a byte fails. PJON
+     can stop reading a frame earlier (another device's id, a rejected
+     header): the strategy is not told, the end then comes at the next call
+     into the strategy (the next bus.receive(), can_start, send_frame...),
+     i.e. at most one loop() later. Mode 7 polling receives a frame in one
+     call: begin and end are around it;
+   - mode 7 polling send_frame, receive_response and send_response.
    They run with interrupts disabled or inside the interrupt and must be
    short, e.g. to drive a project's own busy line on a fixed pin:
      #define SWBB_FRAME_BEGIN() (PORTB |= _BV(PB0))
      #define SWBB_FRAME_END()   (PORTB &= ~_BV(PB0))
-   Begin and end calls are always paired. */
+   Begin and end calls are always paired. The polling reception tracking
+   costs nothing when the hooks are not defined. */
 
+#ifdef SWBB_FRAME_BEGIN
+  #define SWBB_FRAME_HOOKS
+#endif
 #ifndef SWBB_FRAME_BEGIN
   #define SWBB_FRAME_BEGIN()
 #endif
@@ -146,6 +158,9 @@ class SoftwareBitBang {
        (returns always true) */
 
     bool begin(uint8_t did = 0) {
+      #ifdef SWBB_PIN
+        random_state() ^= (uint16_t)PJON_RANDOM(65535) ^ ((uint16_t)did << 8);
+      #endif
       PJON_DELAY(PJON_RANDOM(SWBB_INITIAL_DELAY) + did);
       return true;
     };
@@ -302,21 +317,60 @@ class SoftwareBitBang {
     };
 
 
+    /* Fast pseudo random number (xorshift, ~20 cycles instead of tens of
+       microseconds for random()), mixed with Timer0: used where the bus
+       must be monitored without interruption. Returns 0 to n - 1 (n <= 256) */
+
+    static uint16_t &random_state() {
+      static uint16_t state = 0xACE1;
+      return state;
+    };
+
+    static uint8_t fast_random(uint16_t n) {
+      #ifdef SWBB_SLOW_RANDOM_TEST
+        return PJON_RANDOM(n);
+      #endif
+      uint16_t &x = random_state();
+      x ^= TCNT0;
+      x ^= x << 7;
+      x ^= x >> 9;
+      x ^= x << 8;
+      if(!x) x = 0xACE1;
+      return (uint8_t)(((uint32_t)(x & 0xFF) * n) >> 8);
+    };
+
+
     /* Check if the channel is free for transmission: no high level for the
        duration of a padding bit, 9.5 data bits and the latency, then for a
        small random time. The bus is monitored continuously, so also short
        keep busy bits of an ongoing exchange are detected. */
 
     bool can_start() {
+      /* The random delay is chosen first: random() takes tens of
+         microseconds, the bus must be monitored without interruption from
+         the beginning of the wait to the start of the transmission */
+      rx_end();
+      uint8_t random_delay = fast_random(SWBB_COLLISION_DELAY);
       bus_release();
-      if(wait_while_low(SWBB_LOOPS(
+      return wait_idle(SWBB_LOOPS(
         SWBB_WIRE_PAD + (SWBB_WIRE_BIT * 9.5) + SWBB_LATENCY
-      ))) return false;
-      uint8_t random_delay = PJON_RANDOM(SWBB_COLLISION_DELAY);
-      if(wait_while_low(
-        ((uint16_t)random_delay * (F_CPU / 1000000UL)) / 6 + 1
-      )) return false;
-      return true;
+      ) + ((uint16_t)random_delay * (F_CPU / 1000000UL)) / 6);
+    };
+
+
+    /* Waits for the bus to stay low for loops iterations of 6 cycles.
+       Returns false if the bus goes high for longer than SWBB_GLITCH_US:
+       shorter high levels are noise (every level a device transmits is
+       longer: keep busy bit >= 4us, padding bit, preamble) */
+
+    static bool wait_idle(uint16_t loops) {
+      for(;;) {
+        uint16_t left = wait_while_low(loops);
+        if(!left) return true;
+        __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_GLITCH_US));
+        if(bus_high()) return false;
+        loops = left;
+      }
     };
 
 
@@ -369,17 +423,23 @@ class SoftwareBitBang {
 
     bool sync(uint16_t max_high, bool continued) {
       uint16_t late = 0;
+      _high = SWBB_LOOPS(SWBB_ACCEPTANCE); // Updated if the bit is too short
       if(bus_high()) {
         if(continued) late = (uint8_t)(TCNT0 - _end) * (64 / 6);
-      } else if(!wait_while_low(SWBB_LOOPS(SWBB_RX_BIT))) return false;
-      uint16_t left = wait_while_high(max_high);
-      if(!left) return false;
-      if((uint16_t)(max_high - left + late) < SWBB_LOOPS(SWBB_ACCEPTANCE))
+      } else if(!wait_while_low(SWBB_LOOPS(SWBB_RX_BIT))) {
+        _high = 0;
         return false;
+      }
+      uint16_t left = wait_while_high(max_high);
+      uint16_t high = max_high - left + late;
+      if(!left || (high < SWBB_LOOPS(SWBB_ACCEPTANCE))) {
+        _high = left ? high : max_high;
+        return false;
+      }
       __builtin_avr_delay_cycles(
         SWBB_CYCLES(SWBB_RX_BIT / 2) - (SWBB_SAMPLE_ADVANCE / 2)
       );
-      if(bus_high()) return false;
+      if(bus_high()) return false; // _high: the padding bit was long enough
       __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_RX_BIT / 2));
       _end = TCNT0;
       return true;
@@ -405,10 +465,42 @@ class SoftwareBitBang {
     };
 
 
+    /* Frame hooks on the polling reception: the frame ends when as many
+       bytes as its length field were received, when a byte fails or at the
+       next call into the strategy if PJON stopped reading it */
+
+    void rx_end() {
+      #ifdef SWBB_FRAME_HOOKS
+        if(_rx_in) {
+          _rx_in = false;
+          SWBB_FRAME_END();
+        }
+      #endif
+    };
+
+
+    void rx_track(uint8_t b) {
+      #ifdef SWBB_FRAME_HOOKS
+        _rx_count++;
+        if(_rx_count == 2) _rx_header = b;
+        else if(_rx_count == 3) {
+          _rx_length = b;
+          if(_rx_header & PJON_EXT_LEN_BIT) _rx_length = 0xFFFF; // byte 4
+        } else if((_rx_count == 4) && (_rx_header & PJON_EXT_LEN_BIT))
+          _rx_length = ((uint16_t)_rx_b2 << 8) | b;
+        if(_rx_count == 3) _rx_b2 = b;
+        if(_rx_count >= 3 && _rx_count >= _rx_length) rx_end();
+      #else
+        (void)b;
+      #endif
+    };
+
+
     /* Receive a frame: */
 
     uint16_t receive_frame(uint8_t *data, uint16_t max_length) {
       if(max_length == PJON_PACKET_MAX_LENGTH) {
+        rx_end(); // The previous frame was not read until its end
         // Look for a frame initializer (returns at once if the bus is low)
         if(!bus_high()) return SWBB_FAIL;
         bus_release();
@@ -429,9 +521,19 @@ class SoftwareBitBang {
         ok = sync();
         atomic_end(sreg);
         if(!ok) return SWBB_FAIL;
+        #ifdef SWBB_FRAME_HOOKS
+          _rx_in = true;
+          _rx_count = 0;
+          _rx_length = 0xFFFF;
+          SWBB_FRAME_BEGIN();
+        #endif
       } // Receive one byte
       uint16_t result = receive_byte();
-      if(result == SWBB_FAIL) return SWBB_FAIL;
+      if(result == SWBB_FAIL) {
+        rx_end();
+        return SWBB_FAIL;
+      }
+      rx_track(result);
       *data = result;
       return 1;
     };
@@ -443,6 +545,7 @@ class SoftwareBitBang {
        to the response timeout. The response is prepended by 2 sync pads. */
 
     uint16_t receive_response() {
+      rx_end();
       SWBB_FRAME_BEGIN();
       uint16_t result = receive_response_();
       SWBB_FRAME_END();
@@ -471,6 +574,12 @@ class SoftwareBitBang {
           uint16_t response = SWBB_FAIL;
           if(sync(SWBB_LOOPS(SWBB_WIRE_PAD_MAX), false))
             response = receive_byte();
+          else if(_high < SWBB_LOOPS(SWBB_ACCEPTANCE)) {
+            /* Shorter than a padding bit: noise, not a response. Keep the
+               bus busy and go on waiting */
+            atomic_end(sreg);
+            continue;
+          }
           atomic_end(sreg);
           // A response was detected, do not keep the bus busy any longer
           return response;
@@ -530,17 +639,35 @@ class SoftwareBitBang {
        additional synchronization pad. */
 
     void send_response(uint8_t response) {
+      rx_end();
       SWBB_FRAME_BEGIN();
       send_response_(response);
       SWBB_FRAME_END();
     };
 
 
+    /* Synchronizes to the falling edge of the transmitter's keep busy bit
+       (waits up to SWBB_RESPONSE_PULSE_WAIT): high levels shorter than
+       SWBB_GLITCH_US are noise and ignored */
+
+    static void wait_keep_busy() {
+      uint16_t loops = SWBB_LOOPS(SWBB_RESPONSE_PULSE_WAIT);
+      for(;;) {
+        loops = wait_while_low(loops);
+        if(!loops) return;
+        uint16_t high = SWBB_LOOPS(SWBB_WIRE_BIT / 2);
+        uint16_t left = wait_while_high(high);
+        if((uint16_t)(high - left) >= SWBB_LOOPS(SWBB_GLITCH_US)) return;
+        if(loops > (uint16_t)(high - left)) loops -= high - left;
+        else return;
+      }
+    };
+
+
     void send_response_(uint8_t response) {
       bus_release();
       uint8_t sreg = atomic_begin();
-      wait_while_low(SWBB_LOOPS(SWBB_RESPONSE_PULSE_WAIT));
-      wait_while_high(SWBB_LOOPS(SWBB_WIRE_BIT / 2));
+      wait_keep_busy();
       __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_RESPONSE_DELAY));
       bus_drive_high();
       send_pad(sreg);
@@ -563,6 +690,7 @@ class SoftwareBitBang {
     /* Send a frame: preamble, frame initializer and data */
 
     void send_frame(uint8_t *data, uint16_t length) {
+      rx_end();
       SWBB_FRAME_BEGIN();
       send_frame_(data, length);
       SWBB_FRAME_END();
@@ -620,6 +748,12 @@ class SoftwareBitBang {
   private:
     uint16_t _timeout;
     uint8_t  _end; // Timer0 count at the end of the last byte received
+    uint16_t _high; // Last padding bit measured by sync (loops)
+    #ifdef SWBB_FRAME_HOOKS
+      bool     _rx_in = false; // A frame is being received (hooks)
+      uint8_t  _rx_header = 0, _rx_b2 = 0;
+      uint16_t _rx_count = 0, _rx_length = 0xFFFF;
+    #endif
 };
 
 #else
@@ -632,15 +766,17 @@ class SoftwareBitBang {
        bits transmitted while a device waits for a response. */
 
     bool can_start() {
+      /* The random time is chosen first: random() takes tens of
+         microseconds and the bus must be polled without interruption until
+         the transmission starts, otherwise a frame started meanwhile by
+         another device is not seen */
+      uint32_t duration =
+        (uint32_t)(SWBB_BIT_SPACER + (SWBB_BIT_WIDTH * 9.5) + SWBB_LATENCY) +
+        PJON_RANDOM(SWBB_COLLISION_DELAY);
       PJON_IO_MODE(_input_pin, INPUT);
       uint32_t time = PJON_MICROS();
-      while(
-        (uint32_t)(PJON_MICROS() - time) <
-        (uint32_t)(SWBB_BIT_SPACER + (SWBB_BIT_WIDTH * 9.5) + SWBB_LATENCY)
-      ) if(PJON_IO_READ(_input_pin)) return false;
-      // Delay for a small random time and then check again
-      PJON_DELAY_MICROSECONDS(PJON_RANDOM(SWBB_COLLISION_DELAY));
-      if(PJON_IO_READ(_input_pin)) return false;
+      while((uint32_t)(PJON_MICROS() - time) < duration)
+        if(PJON_IO_READ(_input_pin)) return false;
       return true;
     };
 

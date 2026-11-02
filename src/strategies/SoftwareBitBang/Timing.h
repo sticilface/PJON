@@ -516,6 +516,15 @@
   #define SWBB_DISCHARGE_US 2
 #endif
 
+/* High levels shorter than this (microseconds) are noise for the direct
+   port access implementation while it waits for an idle bus or for the
+   transmitter's keep busy bit: the shortest level a device transmits is
+   the keep busy bit (4us in modes 5-7) */
+
+#ifndef SWBB_GLITCH_US
+  #define SWBB_GLITCH_US 1.5
+#endif
+
 /* Frame preamble length (by default set to 1 x SWBB_BIT_SPACER)
    Maximum allowed value is 100 or a preamble of 100 x SWBB_BIT_SPACER
    When devices execute other tasks frames may be lost unheard. The preamble

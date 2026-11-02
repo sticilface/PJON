@@ -3,7 +3,8 @@
 # to one receiver (B id 2): fairness and acknowledged-but-not-received.
 # Usage: ./three.sh "<tx flags>" "<rx flags>"   Environment: COUNT, LENGTH,
 # TX_RECEIVE_US (receive time between packets, default 0 = Mode7LinkTest),
-# SIM_FLAGS (e.g. "-C 1500"), SIM_TIME
+# SIM_FLAGS (e.g. "-C 1500"), SIM_TIME, TX_TIME_MS (transmit for this time
+# instead of COUNT attempts: acknowledged per transmitter = throughput share)
 set -u
 cd "$(dirname "$0")"
 HERE=$(pwd)
@@ -15,7 +16,7 @@ COUNT=${COUNT:-500}
 CXXFLAGS="-mmcu=atmega328p -DF_CPU=16000000UL -Os -std=gnu++11 -fno-exceptions
   -fno-rtti -fno-threadsafe-statics -ffunction-sections -fdata-sections
   -Wl,--gc-sections -DARDUINO=10819 -I$SHIM -I$SRC -DBUS_PIN=2
-  -DCOUNT=$COUNT ${LENGTH:+-DLENGTH=$LENGTH}"
+  -DCOUNT=$COUNT ${LENGTH:+-DLENGTH=$LENGTH} ${TX_TIME_MS:+-DTX_TIME_MS=$TX_TIME_MS}"
 if [ ! -x "$BUILD/swbb_sim" ] || [ swbb_sim.c -nt "$BUILD/swbb_sim" ]; then
   gcc -O2 -Wall -I/usr/include/simavr -o "$BUILD/swbb_sim" swbb_sim.c \
     -lsimavr -lelf -lpthread -lm || exit 2

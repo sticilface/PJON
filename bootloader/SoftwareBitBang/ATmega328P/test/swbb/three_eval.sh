@@ -4,10 +4,12 @@
 # P = portable. Extra flags for all three nodes: EXTRA, for the receiver:
 # RX_EXTRA, for the transmitters: TX_EXTRA.
 cd "$(dirname "$0")"
-flags() {
+flags() { # LIB=<src dir> builds F, W and P from another library version
+  local lib=""
+  [ -n "${LIB:-}" ] && lib="-I$LIB"
   case $1 in
-    O) echo "-Ibuild/orig_src";; P) echo "";; F) echo "-DSWBB_PIN=2";;
-    W) echo "-DSWBB_PIN=2 -DSWBB_INTERRUPT_WAKE";;
+    O) echo "-Ibuild/orig_src";; P) echo "$lib";; F) echo "$lib -DSWBB_PIN=2";;
+    W) echo "$lib -DSWBB_PIN=2 -DSWBB_INTERRUPT_WAKE";;
   esac
 }
 out=$(./three.sh "$(flags $2) -DSWBB_MODE=$1 ${EXTRA:-} ${TX_EXTRA:-}" \

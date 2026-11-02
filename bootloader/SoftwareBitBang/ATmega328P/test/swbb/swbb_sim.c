@@ -15,6 +15,16 @@
                  bus is then a single RC node instead of an ideal wire
      -R ohm      series resistor of each device (default 100, with -C)
      -P ohm      pull-down resistor of the bus (default 100000, with -C)
+     -N rate:nC[:us]  noise (with -C): charge injections coupled into the
+                 bus (e.g. edges in a neighbouring conductor), Poisson with
+                 `rate` per second, each `nC` nanocoulomb of random sign
+                 spread over `us` microseconds (default 0.5): on an undriven
+                 bus a jump of Q/C decaying with R(pull-down) x C
+     -H uA       noise (with -C): 50Hz hum current of this amplitude (an
+                 undriven bus sees ~ uA x R(pull-down))
+     -O v[,v[,v]] ground offset of A[,B[,C]] in volts (the device sees the
+                 bus voltage plus its offset)
+     -s seed     seed of the noise generator (default 1)
                  The level seen by each device has the ATmega328P input
                  hysteresis (rising 2.7V, falling 2.2V at 5V).
      -h          print a histogram of high/low durations per driver
@@ -150,6 +160,7 @@ static int drives_low(avr_t *a) {
 /* Histogram of pulse durations (0.5us buckets) per driver and level */
 #define HMAX 600
 static uint32_t hist[NMAX + 1][2][HMAX];
+static uint32_t noise_events = 0, noise_edges[NMAX];
 
 int main(int argc, char **argv) {
   const char *hex[NMAX] = {NULL, NULL, NULL};
@@ -160,7 +171,10 @@ int main(int argc, char **argv) {
   long b_reset = -1, b_frequency = 16000000, c_frequency = 16000000;
   double max_seconds = 10;
   double cap_pf = 0, r_series = 100, r_pull = 100000;
-  while((opt = getopt(argc, argv, "a:b:c:B:M:t:ehr:F:G:TSC:R:P:")) != -1) {
+  double noise_rate = 0, noise_q = 0, noise_w = 0.5, hum_ua = 0;
+  double offset[NMAX] = {0, 0, 0};
+  unsigned long seed = 1;
+  while((opt = getopt(argc, argv, "a:b:c:B:M:t:ehr:F:G:TSC:R:P:N:H:O:s:")) != -1) {
     switch(opt) {
       case 'a': hex[0] = optarg; break;
       case 'b': hex[1] = optarg; break;
@@ -194,6 +208,27 @@ int main(int argc, char **argv) {
       case 'C': cap_pf = atof(optarg); break;
       case 'R': r_series = atof(optarg); break;
       case 'P': r_pull = atof(optarg); break;
+      case 'N': {
+        noise_rate = atof(optarg);
+        char *c = strchr(optarg, ':');
+        if(c) {
+          noise_q = atof(c + 1);
+          c = strchr(c + 1, ':');
+          if(c) noise_w = atof(c + 1);
+        }
+        break;
+      }
+      case 'H': hum_ua = atof(optarg); break;
+      case 'O': {
+        char *p = optarg;
+        for(int n = 0; n < NMAX; n++) {
+          offset[n] = atof(p);
+          char *c = strchr(p, ',');
+          if(c) p = c + 1;
+        }
+        break;
+      }
+      case 's': seed = strtoul(optarg, NULL, 0); break;
       default: return 2;
     }
   }
@@ -285,6 +320,7 @@ int main(int argc, char **argv) {
          time elapsed since the last step */
       static double v = 0, t_last = 0;
       static int state_seen[NMAX] = {0, 0, 0};
+      static double next_noise = -1, noise_end = -1, noise_i = 0;
       double now = us(avr), dt = (now - t_last) * 1e-6;
       t_last = now;
       double g = 1.0 / r_pull, i = 0, gd = 1.0 / (r_series + 25);
@@ -292,11 +328,34 @@ int main(int argc, char **argv) {
         if(high[n]) { g += gd; i += gd * 5.0; }
         else if(low[n]) g += gd;
       }
+      /* Noise current sources */
+      if(noise_rate > 0) {
+        if(next_noise < 0) {
+          srand48(seed);
+          next_noise = now - log(1 - drand48()) * 1e6 / noise_rate;
+        }
+        if(now >= next_noise) {
+          noise_i = (drand48() < 0.5 ? -1 : 1) * noise_q * 1e-9 /
+            (noise_w * 1e-6);
+          noise_end = now + noise_w;
+          next_noise = now - log(1 - drand48()) * 1e6 / noise_rate;
+          noise_events++;
+        }
+        if(now < noise_end) i += noise_i;
+      }
+      if(hum_ua > 0) i += hum_ua * 1e-6 * sin(2 * M_PI * 50 * now * 1e-6);
       double v_end = i / g, tau = cap_pf * 1e-12 / g;
       if(dt > 0) v = v_end + (v - v_end) * exp(-dt / tau);
+      /* Input protection diodes and drivers clamp the bus */
+      if(v > 5.6) v = 5.6;
+      if(v < -0.6) v = -0.6;
+      int driven = any_high || any_low;
       for(int n = 0; n < nodes; n++) {
-        if(!state_seen[n] && v > 2.7) state_seen[n] = 1;
-        else if(state_seen[n] && v < 2.2) state_seen[n] = 0;
+        double vn = v + offset[n];
+        int before = state_seen[n];
+        if(!state_seen[n] && vn > 2.7) state_seen[n] = 1;
+        else if(state_seen[n] && vn < 2.2) state_seen[n] = 0;
+        if(!driven && state_seen[n] != before) noise_edges[n]++;
         seen[n] = state_seen[n];
       }
       level = seen[0];
@@ -344,6 +403,12 @@ int main(int argc, char **argv) {
           if(hist[d][l][b] > 2) printf(" %.1f(%u)", b / 2.0, hist[d][l][b]);
         printf("\n");
       }
+  }
+  if(noise_rate > 0 || hum_ua > 0) {
+    printf("sim: noise injections %u, level changes seen on the undriven bus:",
+      noise_events);
+    for(int n = 0; n < nodes; n++) printf(" %c %u", 'A' + n, noise_edges[n]);
+    printf("\n");
   }
   if(stack)
     for(int n = 0; n < nodes; n++)

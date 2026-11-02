@@ -78,6 +78,9 @@
   #define SWBB_WAKE_ALIVE_MS 100
 #endif
 
+/* SWBB_WAKE_HEARTBEAT: bus.receive() does not count as a sign of life, the
+   application calls bus.strategy.alive() itself (see alive()) */
+
 #include "SoftwareBitBangAccept.h"
 
 #ifndef SWBB_WAKE_QUIET
@@ -90,6 +93,10 @@
 #else
   #define SWBB_WAKE_STAT(X)
 #endif
+
+#define SWBB_WAKE_NOISE 0
+#define SWBB_WAKE_FRAME 1
+#define SWBB_WAKE_ACKED 2
 
 namespace swbb_wake {
   typedef SoftwareBitBangPolling P;
@@ -112,6 +119,7 @@ namespace swbb_wake {
   extern uint8_t id;
   extern uint8_t end;
   extern uint32_t last_rise;
+  extern uint32_t last_activity;
   extern volatile uint32_t last_alive;
   #ifdef SWBB_WAKE_STATS
     extern volatile uint16_t wakes, stored, foreign, dropped, rejected, unalive;
@@ -128,6 +136,9 @@ namespace swbb_wake {
   SWBB_WAKE_STORAGE uint8_t id = 0;
   SWBB_WAKE_STORAGE uint8_t end = 0;          // Timer0 count at the end of a byte
   SWBB_WAKE_STORAGE uint32_t last_rise = 0;   // micros() of the last rising edge
+  /* micros() of the last bus activity seen by the interrupt (its entry and
+     exit), used by can_start: unlike last_rise it is never moved back */
+  SWBB_WAKE_STORAGE uint32_t last_activity = 0;
   SWBB_WAKE_STORAGE volatile uint32_t last_alive = 0; // millis() of the last bus.receive()
 
   // Statistics (define SWBB_WAKE_STATS to count, 18 bytes of RAM)
@@ -155,10 +166,17 @@ namespace swbb_wake {
 
   /* First padding bit: the interrupt was triggered by its rising edge, its
      measured duration is not checked (the interrupt may have been delayed) */
+  /* Duration of the first high level seen by the interrupt (loops): a
+     wake that fails on a short one is noise */
+  static uint16_t first_high;
+
   static bool sync_first() {
+    first_high = 0;
     if(!P::bus_high()) return false;
-    if(!P::wait_while_high(SWBB_LOOPS(SWBB_WIRE_PAD_MAX * SWBB_MAX_PREAMBLE)))
-      return false;
+    const uint16_t max = SWBB_LOOPS(SWBB_WIRE_PAD_MAX * SWBB_MAX_PREAMBLE);
+    uint16_t left = P::wait_while_high(max);
+    first_high = max - left;
+    if(!left) return false;
     __builtin_avr_delay_cycles(
       SWBB_CYCLES(SWBB_RX_BIT / 2) - (SWBB_SAMPLE_ADVANCE / 2)
     );
@@ -198,8 +216,7 @@ namespace swbb_wake {
      padding bits) */
   static void acknowledge() {
     P::bus_release();
-    P::wait_while_low(SWBB_LOOPS(SWBB_RESPONSE_PULSE_WAIT));
-    P::wait_while_high(SWBB_LOOPS(SWBB_WIRE_BIT / 2));
+    P::wait_keep_busy();
     __builtin_avr_delay_cycles(SWBB_CYCLES(SWBB_RESPONSE_DELAY));
     P::bus_drive_high();
     P::send_pad(0x80);
@@ -210,21 +227,45 @@ namespace swbb_wake {
   /* Receives a frame, called by the interrupt with interrupts disabled.
      Inlined in the interrupt: one call frame less on the stack, that the
      interrupt adds to the application's (measured: see stack_eval.sh) */
-  static inline __attribute__((always_inline)) void receive() {
+  /* A wake that failed before the frame initializer was recognised: noise
+     if the first high level was shorter than half the acceptance (a glitch:
+     the receiver must wake again at once), otherwise a real padding bit or
+     data inside a frame (its other edges are ignored for SWBB_WAKE_QUIET) */
+  static inline uint8_t noise_or_frame() {
+    return (first_high < SWBB_LOOPS(SWBB_ACCEPTANCE / 2)) ?
+      SWBB_WAKE_NOISE : SWBB_WAKE_FRAME;
+  }
+
+  /* Returns SWBB_WAKE_NOISE if no frame initializer was recognised (noise
+     or a glitch), SWBB_WAKE_FRAME if a frame was received (or discarded)
+     without acknowledgement, SWBB_WAKE_ACKED if it was acknowledged */
+  static inline __attribute__((always_inline)) uint8_t receive() {
     SWBB_WAKE_STAT(wakes++);
-    if(count >= SWBB_WAKE_FRAMES) { SWBB_WAKE_STAT(dropped++); return; }
+    if(count >= SWBB_WAKE_FRAMES) {
+      SWBB_WAKE_STAT(dropped++);
+      return SWBB_WAKE_FRAME;
+    }
     Frame &f = queue[(uint8_t)(head + count) % SWBB_WAKE_FRAMES];
-    if(!sync_first()) { SWBB_WAKE_STAT(failed_first++); return; }
+    if(!sync_first()) {
+      SWBB_WAKE_STAT(failed_first++);
+      return noise_or_frame();
+    }
     window();
-    if(!sync_next()) { SWBB_WAKE_STAT(failed_init++); return; }
+    if(!sync_next()) {
+      SWBB_WAKE_STAT(failed_init++);
+      return noise_or_frame();
+    }
     window();
-    if(!sync_next()) { SWBB_WAKE_STAT(failed_init++); return; }
+    if(!sync_next()) {
+      SWBB_WAKE_STAT(failed_init++);
+      return noise_or_frame();
+    }
     /* Between bytes only the byte is stored and the first bytes checked,
        so that other interrupts have most of the padding bit to run (two
        interrupt handlers can be served in the same padding bit) */
     uint8_t length = PJON_PACKET_MAX_LENGTH;
     for(uint8_t i = 0; i < length; i++) {
-      if(!sync_next()) { SWBB_WAKE_STAT(failed_byte++); return; }
+      if(!sync_next()) { SWBB_WAKE_STAT(failed_byte++); return SWBB_WAKE_FRAME; }
       uint8_t b = P::read_byte();
       end = TCNT0;
       sei(); // The next padding bit is being received
@@ -233,15 +274,15 @@ namespace swbb_wake {
         if((b != id) && (b != PJON_BROADCAST)) {
           SWBB_WAKE_STAT(foreign++);
           cli();
-          return; // Not for this device, its other bytes are ignored
+          return SWBB_WAKE_FRAME; // Not for this device, its other bytes are ignored
         }
       } else if(i == 1) {
-        if(b & PJON_EXT_LEN_BIT) { cli(); return; }
+        if(b & PJON_EXT_LEN_BIT) { cli(); return SWBB_WAKE_FRAME; }
       } else if(i == 2) {
         length = b;
         if((length < 5) || (length > PJON_PACKET_MAX_LENGTH)) {
           cli();
-          return;
+          return SWBB_WAKE_FRAME;
         }
       }
       cli();
@@ -268,20 +309,21 @@ namespace swbb_wake {
     bool alive = !SWBB_WAKE_ALIVE_MS ||
       ((uint32_t)(millis() - last_alive) <= SWBB_WAKE_ALIVE_MS);
     cli();
-    if(accept == SWBB_REJECT) { SWBB_WAKE_STAT(rejected++); return; }
+    if(accept == SWBB_REJECT) { SWBB_WAKE_STAT(rejected++); return SWBB_WAKE_FRAME; }
     bool requested = (f.data[0] == id) && (header & PJON_ACK_REQ_BIT);
     bool ack = requested && (accept == SWBB_ACCEPT);
     if(ack && !alive) {
       /* Not acknowledged: the transmitter retries, storing it would deliver
          it twice */
       SWBB_WAKE_STAT(unalive++);
-      return;
+      return SWBB_WAKE_FRAME;
     }
     if(ack) acknowledge();
     f.length = length;
     f.acked = ack;
     count++;
     SWBB_WAKE_STAT(stored++);
+    return ack ? SWBB_WAKE_ACKED : SWBB_WAKE_FRAME;
   }
 }
 
@@ -303,16 +345,28 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
 
     /* Serve a frame received by the interrupt (all its bytes at once) */
 
+    /* The application is alive: the interrupt acknowledges frames only if
+       this was called in the last SWBB_WAKE_ALIVE_MS milliseconds. Called by
+       bus.receive(), unless SWBB_WAKE_HEARTBEAT is defined: then only the
+       application calls it, from a place that runs only when it works (e.g.
+       the end of loop()), so that an application stuck in a path that
+       still calls bus.receive() is detected too. */
+
+    static void alive() {
+      uint32_t now = millis();
+      uint8_t sreg = SREG;
+      cli();
+      swbb_wake::last_alive = now;
+      SREG = sreg;
+    };
+
+
     uint16_t receive_frame(uint8_t *data, uint16_t max_length) {
       using namespace swbb_wake;
       if(max_length != PJON_PACKET_MAX_LENGTH) return SWBB_FAIL;
-      { // The application calls bus.receive() (atomic: read by the interrupt)
-        uint32_t now = millis();
-        uint8_t sreg = SREG;
-        cli();
-        last_alive = now;
-        SREG = sreg;
-      }
+      #ifndef SWBB_WAKE_HEARTBEAT // With it only alive() counts
+        alive();
+      #endif
       if(!count) return SWBB_FAIL;
       Frame &f = queue[head];
       uint16_t length = f.length;
@@ -330,6 +384,23 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
 
     uint16_t receive_byte() {
       return SWBB_FAIL;
+    };
+
+
+    /* The interrupt can run while can_start waits (it receives the
+       beginning of a frame addressed to another device, ~0.6ms in mode 3):
+       the waiting loop is paused and does not see that activity. The bus is
+       free only if the interrupt saw no rising edge during the idle time. */
+
+    bool can_start() {
+      if(!SoftwareBitBangPolling::can_start()) return false;
+      uint8_t sreg = SREG;
+      cli();
+      uint32_t last = swbb_wake::last_activity;
+      SREG = sreg;
+      return (uint32_t)(PJON_MICROS() - last) >= (uint32_t)(
+        SWBB_WIRE_PAD + (SWBB_WIRE_BIT * 9.5) + SWBB_LATENCY
+      );
     };
 
 
@@ -365,7 +436,7 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
     static void irq_on() {
       uint8_t sreg = SREG;
       cli();
-      swbb_wake::last_rise = PJON_MICROS();
+      swbb_wake::last_rise = swbb_wake::last_activity = PJON_MICROS();
       EIFR = SWBB_WAKE_FLAG;
       EIMSK |= SWBB_WAKE_ENABLE;
       SREG = sreg;
@@ -383,15 +454,29 @@ ISR(SWBB_WAKE_VECT) {
   #endif
   uint32_t now = PJON_MICROS();
   uint32_t gap = now - last_rise;
-  last_rise = now;
+  last_rise = last_activity = now;
   if(gap >= SWBB_WAKE_QUIET) { // Not inside a frame or an exchange
     EIMSK &= ~SWBB_WAKE_ENABLE; // No re-entry while nested
     SWBB_FRAME_BEGIN();
-    receive();
+    uint8_t result = receive();
     SWBB_FRAME_END();
-    last_rise = PJON_MICROS();
-    EIFR = SWBB_WAKE_FLAG;
+    if(result == SWBB_WAKE_NOISE) {
+      /* No frame initializer: noise or a glitch. The next rising edge must
+         wake the receiver (a frame may start at once): no quiet time, and
+         a rising edge seen meanwhile (interrupt flag) is served at once */
+      last_rise = now - SWBB_WAKE_QUIET;
+    } else {
+      /* Edges until now belong to this frame. After an acknowledgement the
+         bus is low since its last rising edge (the ACK byte 0x06 rises at
+         its second bit, 7 bits before its end): the next frame may start
+         SWBB_WAKE_QUIET after it, so the time of that edge is recorded, not
+         the time the interrupt ends (that would ignore the next frame) */
+      last_rise = PJON_MICROS() - ((result == SWBB_WAKE_ACKED) ?
+        (uint32_t)(SWBB_TX_BIT * 7 + SWBB_DISCHARGE_US) : 0);
+      EIFR = SWBB_WAKE_FLAG;
+    }
     EIMSK |= SWBB_WAKE_ENABLE;
+    last_activity = PJON_MICROS();
   }
   #ifdef SWBB_IRQ_PIN_DEBUG
     PORTD &= ~8;

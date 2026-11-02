@@ -7,6 +7,18 @@
 #ifndef SWBB_INITIAL_DELAY
   #define SWBB_INITIAL_DELAY 1
 #endif
+#ifdef HOOK_TEST
+  /* Frame hooks: counted, nesting and unpaired calls detected, PD3 high
+     between begin and end (traced by swbb_sim -e for node B) */
+  #include <stdint.h>
+  #include <avr/io.h>
+  volatile uint16_t hook_begin = 0, hook_end = 0, hook_bad = 0;
+  volatile uint8_t hook_depth = 0;
+  #define SWBB_FRAME_BEGIN() do { hook_begin++; if(hook_depth++) hook_bad++; \
+    DDRD |= 8; PORTD |= 8; } while(0)
+  #define SWBB_FRAME_END() do { hook_end++; if(!hook_depth) hook_bad++; \
+    else hook_depth--; PORTD &= ~8; } while(0)
+#endif
 #define SWBB_M7_STATS // Mode 7 statistics, printed with DONE
 #define SWBB_WAKE_STATS // Wake receiver statistics, printed with DONE
 #include <PJONSoftwareBitBang.h>
@@ -40,6 +52,15 @@ static void print_number(uint32_t n) {
   b[10] = 0;
   do { b[--i] = '0' + (n % 10); n /= 10; } while(n);
   Serial.print(b + i);
+}
+
+static void print_hooks() {
+  #ifdef HOOK_TEST
+    Serial.print(" hooks "); print_number(hook_begin);
+    Serial.print("/"); print_number(hook_end);
+    Serial.print(" bad "); print_number(hook_bad);
+    Serial.print(" open "); print_number(hook_depth);
+  #endif
 }
 
 static void receiver(uint8_t *payload, uint16_t length,
@@ -94,12 +115,26 @@ void setup() {
 
 void loop() {
 #ifdef ROLE_TX
-  static uint16_t n = 0, ok = 0, fail = 0;
+  static uint16_t n = 0, ok = 0, fail = 0, busy = 0;
   static uint32_t start, elapsed;
   if(!n) start = micros();
   static uint8_t payload[LENGTH];
   if(n == 0 && millis() < 10) return; // let the receiver start
+  #ifdef TX_TIME_MS // Transmit for TX_TIME_MS (Mode7LinkTest loop) not COUNT
+    static bool tx_done = false;
+    if(!tx_done && millis() >= TX_TIME_MS) {
+      tx_done = true;
+      Serial.print("DONE ok "); print_number(ok);
+      Serial.print(" fail "); print_number(fail);
+      Serial.print(" busy "); print_number(busy);
+      Serial.print(" us "); print_number(micros() - start);
+      print_hooks();
+      Serial.println("");
+    }
+    if(!tx_done) {
+  #else
   if(n < COUNT) {
+  #endif
     #ifndef PAYLOAD_OFFSET
       #define PAYLOAD_OFFSET 0
     #endif
@@ -110,16 +145,23 @@ void loop() {
          and the keep busy bits that follow are traffic to ignore */
       bus.send_packet(77, payload, LENGTH);
     #endif
-    if(bus.send_packet(PEER, payload, LENGTH) == PJON_ACK) ok++;
+    uint16_t r = bus.send_packet(PEER, payload, LENGTH);
+    if(r == PJON_ACK) ok++;
+    else if(r == PJON_BUSY) busy++;
     else fail++;
     n++;
     #ifdef TX_GAP_MS
       delay(TX_GAP_MS); // Time between packets
     #endif
+    #ifdef TX_TIME_MS
+      if(false) {
+    #else
     if(n == COUNT) {
+    #endif
       elapsed = micros() - start;
       Serial.print("DONE ok "); print_number(ok);
       Serial.print(" fail "); print_number(fail);
+      Serial.print(" busy "); print_number(busy);
       Serial.print(" us "); print_number(elapsed);
       #if SWBB_MODE == 7
         Serial.print(" window_ticks "); print_number(swbb_m7::max_ticks);
@@ -132,6 +174,7 @@ void loop() {
           }
         #endif
       #endif
+      print_hooks();
       Serial.println("");
     }
   }
@@ -163,6 +206,15 @@ void loop() {
       }
       return;
     }
+  #endif
+  #ifdef SWBB_WAKE_HEARTBEAT
+    /* The application signals it works; after RX_HEARTBEAT_STOP_MS it is
+       "stuck" in a path that still calls bus.receive() but not alive() */
+    #ifdef RX_HEARTBEAT_STOP_MS
+      if(millis() < RX_HEARTBEAT_STOP_MS) bus.strategy.alive();
+    #else
+      bus.strategy.alive();
+    #endif
   #endif
   #ifdef BUSY_US
     /* The application is busy for BUSY_US between two bus.receive() calls */
@@ -222,6 +274,7 @@ void loop() {
       Serial.print("/"); print_number(swbb_wake::failed_init);
       Serial.print("/"); print_number(swbb_wake::failed_byte);
     #endif
+    print_hooks();
     Serial.println("");
   }
 #endif
