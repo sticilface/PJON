@@ -1,7 +1,10 @@
 /* Simulation of two ATmega328P running PJON SoftwareBitBang sketches on a
    single wire bus (used to test SoftwareBitBang itself, see run_swbb_tests.sh)
 
-   Usage: swbb_sim -a nodeA.hex -b nodeB.hex [options]
+   Usage: swbb_sim -a nodeA.hex -b nodeB.hex [-c nodeC.hex] [options]
+     -c hex      third node (C) on the same bus
+     -G hz       node C clock frequency (default 16000000), e.g. 16008000 for
+                 +500ppm: devices never have exactly the same clock
      -B pin      bus pin, Arduino numbering (default 2)
      -t seconds  maximum simulated time (default 10)
      -e          print every bus level change (microseconds, who drives)
@@ -16,9 +19,11 @@
                  expected to print DONE
      -F hz       node B clock frequency (default 16000000)
      -T          append the simulated time to the lines printed by the nodes
-   The USART0 output of each node is printed prefixed by "A: " or "B: ".
-   The simulation ends when both nodes printed a line starting with "DONE"
-   or when the maximum time is reached. Exit code 0 if both printed DONE. */
+     -S          print the lowest stack pointer of each node at the end (with
+                 __heap_start from avr-nm: free stack = min SP - heap start)
+   The USART0 output of each node is printed prefixed by "A: ", "B: ", "C: ".
+   The simulation ends when all nodes printed a line starting with "DONE"
+   or when the maximum time is reached. Exit code 0 if all printed DONE. */
 
 #include <stdio.h>
 #include <math.h>
@@ -34,10 +39,12 @@
 
 #define MCU "atmega328p"
 
-static avr_t *node[2];
+#define NMAX 3
+static int nodes = 2;
+static avr_t *node[NMAX];
 static int pin_reg, ddr_reg, port_reg, mask, bus_bit;
 static char bus_port;
-static avr_irq_t *pin_irq[2];
+static avr_irq_t *pin_irq[NMAX];
 
 /* Sets the bus level seen by a node: through the port pin IRQ, so that pin
    change and external interrupts (INT0/INT1) are triggered */
@@ -47,8 +54,8 @@ static void set_level(int n, int level) {
   if(level) a->data[pin_reg] |= mask;
   else a->data[pin_reg] &= ~mask;
 }
-static char line[2][256];
-static int line_len[2], done[2], stamp = 0;
+static char line[NMAX][256];
+static int line_len[NMAX], done[NMAX], stamp = 0;
 
 static void load(avr_t *avr, const char *path) {
   uint32_t size = 0, start = 0;
@@ -88,25 +95,30 @@ static int drives_low(avr_t *a) {
 
 /* Histogram of pulse durations (0.5us buckets) per driver and level */
 #define HMAX 600
-static uint32_t hist[3][2][HMAX];
+static uint32_t hist[NMAX + 1][2][HMAX];
 
 int main(int argc, char **argv) {
-  const char *hex[2] = {NULL, NULL};
-  int bus_pin = 2, trace = 0, histo = 0, opt;
-  long b_reset = -1, b_frequency = 16000000;
+  const char *hex[NMAX] = {NULL, NULL, NULL};
+  int bus_pin = 2, trace = 0, histo = 0, stack = 0, opt;
+  uint16_t min_sp[NMAX] = {0xFFFF, 0xFFFF, 0xFFFF};
+  uint16_t isr_depth[NMAX] = {0, 0, 0};
+  long b_reset = -1, b_frequency = 16000000, c_frequency = 16000000;
   double max_seconds = 10;
   double cap_pf = 0, r_series = 100, r_pull = 100000;
-  while((opt = getopt(argc, argv, "a:b:B:t:ehr:F:TC:R:P:")) != -1) {
+  while((opt = getopt(argc, argv, "a:b:c:B:t:ehr:F:G:TSC:R:P:")) != -1) {
     switch(opt) {
       case 'a': hex[0] = optarg; break;
       case 'b': hex[1] = optarg; break;
+      case 'c': hex[2] = optarg; nodes = 3; break;
       case 'B': bus_pin = atoi(optarg); break;
       case 't': max_seconds = atof(optarg); break;
       case 'e': trace = 1; break;
       case 'T': stamp = 1; break;
+      case 'S': stack = 1; break;
       case 'h': histo = 1; break;
       case 'r': b_reset = strtol(optarg, NULL, 0); break;
       case 'F': b_frequency = atol(optarg); break;
+      case 'G': c_frequency = atol(optarg); break;
       case 'C': cap_pf = atof(optarg); break;
       case 'R': r_series = atof(optarg); break;
       case 'P': r_pull = atof(optarg); break;
@@ -122,12 +134,13 @@ int main(int argc, char **argv) {
   ddr_reg = pin_reg + 1;
   port_reg = pin_reg + 2;
 
-  for(int n = 0; n < 2; n++) {
+  for(int n = 0; n < nodes; n++) {
     node[n] = avr_make_mcu_by_name(MCU);
     avr_init(node[n]);
     node[n]->frequency = 16000000;
     node[n]->log = LOG_WARNING;
     load(node[n], hex[n]);
+    if(n == 2) node[n]->frequency = c_frequency;
     if(n == 1) {
       node[n]->frequency = b_frequency;
       if(b_reset >= 0) {
@@ -146,55 +159,92 @@ int main(int argc, char **argv) {
     avr_ioctl(node[n], AVR_IOCTL_UART_SET_FLAGS('0'), &f);
   }
 
-  int last_level = 0, last_driver = 2, contention = 0, contention_now = 0;
+  int last_level = 0, last_driver = NMAX, contention = 0, contention_now = 0;
   double last_edge = 0;
   for(;;) {
-    avr_t *avr = (us(node[0]) <= us(node[1])) ? node[0] : node[1];
+    avr_t *avr = node[0];
+    for(int n = 1; n < nodes; n++) if(us(node[n]) < us(avr)) avr = node[n];
     int state = avr_run(avr);
+    if(stack) {
+      int n = 0;
+      while(node[n] != avr) n++;
+      uint16_t sp = avr->data[0x5D] | (avr->data[0x5E] << 8);
+      if(sp >= 0x100 && sp < min_sp[n] && avr->cycle > 1000) min_sp[n] = sp;
+      /* Stack used by the INT0 interrupt (vector at 0x0004), including the
+         interrupts nested in it: from its entry (return address pushed)
+         to the lowest stack pointer before it returns */
+      static int in_isr[NMAX];
+      static uint16_t entry_sp[NMAX], isr_min[NMAX];
+      if(!in_isr[n] && avr->pc == 0x0004) {
+        in_isr[n] = 1;
+        entry_sp[n] = isr_min[n] = sp;
+      } else if(in_isr[n]) {
+        if(sp < isr_min[n]) isr_min[n] = sp;
+        if(sp > entry_sp[n]) {
+          in_isr[n] = 0;
+          uint16_t d = entry_sp[n] - isr_min[n] + 2;
+          if(d > isr_depth[n]) isr_depth[n] = d;
+        }
+      }
+    }
     if(state == cpu_Done || state == cpu_Crashed) {
-      printf("sim: node %c stopped (state %d)\n", avr == node[0] ? 'A':'B', state);
+      int n = 0;
+      while(node[n] != avr) n++;
+      printf("sim: node %c stopped (state %d)\n", 'A' + n, state);
       break;
     }
-    int ha = drives_high(node[0]), hb = drives_high(node[1]);
-    int level = ha || hb;
+    int high[NMAX], low[NMAX], any_high = 0, any_low = 0, first_high = -1;
+    for(int n = 0; n < nodes; n++) {
+      high[n] = drives_high(node[n]);
+      low[n] = drives_low(node[n]);
+      if(high[n] && first_high < 0) first_high = n;
+      any_high |= high[n];
+      any_low |= low[n];
+    }
+    int level = any_high;
+    int seen[NMAX];
+    for(int n = 0; n < nodes; n++) seen[n] = level;
     if(cap_pf > 0) {
       /* Analog bus: drivers (25 ohm output + series resistor) and the
          pull-down charge the bus capacitance, integrated exactly over the
          time elapsed since the last step */
       static double v = 0, t_last = 0;
-      static int seen[2] = {0, 0};
+      static int state_seen[NMAX] = {0, 0, 0};
       double now = us(avr), dt = (now - t_last) * 1e-6;
       t_last = now;
       double g = 1.0 / r_pull, i = 0, gd = 1.0 / (r_series + 25);
-      for(int n = 0; n < 2; n++) {
-        if(drives_high(node[n])) { g += gd; i += gd * 5.0; }
-        else if(drives_low(node[n])) g += gd;
+      for(int n = 0; n < nodes; n++) {
+        if(high[n]) { g += gd; i += gd * 5.0; }
+        else if(low[n]) g += gd;
       }
       double v_end = i / g, tau = cap_pf * 1e-12 / g;
       if(dt > 0) v = v_end + (v - v_end) * exp(-dt / tau);
-      for(int n = 0; n < 2; n++) {
-        if(!seen[n] && v > 2.7) seen[n] = 1;
-        else if(seen[n] && v < 2.2) seen[n] = 0;
+      for(int n = 0; n < nodes; n++) {
+        if(!state_seen[n] && v > 2.7) state_seen[n] = 1;
+        else if(state_seen[n] && v < 2.2) state_seen[n] = 0;
+        seen[n] = state_seen[n];
       }
-      set_level(1, seen[1]);
       level = seen[0];
     }
-    if((ha && drives_low(node[1])) || (hb && drives_low(node[0]))) {
+    if(any_high && any_low) {
       if(!contention_now) {
         contention++;
         if(trace) printf("%.2f contention\n", us(avr));
       }
       contention_now = 1;
     } else contention_now = 0;
-    set_level(0, level);
-    if(cap_pf <= 0) set_level(1, level);
+    for(int n = 0; n < nodes; n++) set_level(n, seen[n]);
     if(level != last_level) {
       double now = us(avr);
-      if(trace) printf("%.2f %d %c%c\n", now, level, ha ? 'A' : '-', hb ? 'B' : '-');
+      if(trace) {
+        printf("%.2f %d ", now, level);
+        for(int n = 0; n < nodes; n++) putchar(high[n] ? 'A' + n : '-');
+        putchar('\n');
+      }
       int b = (int)((now - last_edge) * 2 + 0.5);
       if(b < HMAX) hist[last_driver][last_level][b]++;
       last_edge = now;
-      last_driver = level ? (ha ? 0 : 1) : last_driver;
+      last_driver = level ? (first_high >= 0 ? first_high : NMAX) : last_driver;
       last_level = level;
     }
     /* Debug pin of node B (PORTD bit 3): printed in the trace */
@@ -203,14 +253,16 @@ int main(int argc, char **argv) {
     if(trace && dbg != last_dbg)
       printf("%.2f dbg %d\n", us(node[1]), dbg);
     last_dbg = dbg;
-    if(done[0] && done[1]) break;
+    int all_done = 1;
+    for(int n = 0; n < nodes; n++) all_done &= done[n];
+    if(all_done) break;
     if(us(avr) > max_seconds * 1e6) {
       printf("sim: maximum simulated time reached\n");
       break;
     }
   }
   if(histo) {
-    for(int d = 0; d < 2; d++)
+    for(int d = 0; d < nodes; d++)
       for(int l = 1; l >= 0; l--) {
         printf("sim: %s pulses driven by %c:", l ? "high" : "low", 'A' + d);
         for(int b = 0; b < HMAX; b++)
@@ -218,7 +270,13 @@ int main(int argc, char **argv) {
         printf("\n");
       }
   }
+  if(stack)
+    for(int n = 0; n < nodes; n++)
+      printf("sim: %c lowest stack pointer 0x%04X INT0 stack %u\n", 'A' + n,
+        min_sp[n], isr_depth[n]);
   printf("sim: simulated %.3fs, bus contention events: %d\n",
     us(node[0]) / 1e6, contention);
-  _exit((done[0] && done[1]) ? 0 : 1);
+  int all_done = 1;
+  for(int n = 0; n < nodes; n++) all_done &= done[n];
+  _exit(all_done ? 0 : 1);
 }

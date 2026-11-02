@@ -30,6 +30,10 @@ Requirements: `apt install gcc-avr avr-libc binutils-avr libsimavr-dev libelf-de
 | `./m7_load.sh`, `./m7_gap.sh` | Mode 7 under interrupt load (handler every 256us on both devices), interrupt window length. |
 | `./m7_collide.sh` | Both devices transmitting to each other at the same time (modes 3, 6, 7, 7 wake). |
 | `./m7_boot.sh` | Mode 7 uploader to bootloader link (200 chunks), bootloader at 16/8MHz. |
+| `./three.sh "<tx flags>" "<rx flags>"`, `./three_eval.sh <mode> <tx> <rx>` | Three devices (`swbb_sim -c`): two transmitters (ids 1 and 3, `TX2_ID` to change the second) sending back to back to one receiver: fairness, acknowledged vs received per sender. `SIM_FLAGS="-G 16008000"` gives the second transmitter a 500ppm faster clock. |
+| `./accept_eval.sh [modes]` | Wake receiver acknowledgements match what PJON accepts (packet id, port, MAC with and without the `PJON_INCLUDE_*` option). `LIB=<src dir>` runs it on another library version. |
+| `./alive_eval.sh [modes]` | `SWBB_WAKE_ALIVE_MS`: the receiver's application stops calling `bus.receive()` (also with the queue looking empty, as after a stack overflow); busy loops of 20/50/150ms. |
+| `./stack_eval.sh` | Static RAM, deepest stack use, stack used by the INT0 interrupt (nested interrupts included) and `pjon_stack_free()`, for polling and wake receivers with 1 and 2 frames (`swbb_sim -S`). |
 | `./bench.sh [modes]` | CPU time taken polling an idle bus, duration of `can_start()`, and how often `can_start()` wrongly reports the bus free while another device is waiting for a response (keep busy bits). |
 
 The simulator (`swbb_sim.c`) drives the bus pin through the simavr port IRQ, so pin change and external interrupts work, traces PD3 of B (`-e`) and reports bus contention: one device driving the bus high while the other drives it low.
