@@ -136,9 +136,44 @@ stayed silent.
 in mode 3. Mode 7 then lost 666 of 222,165 packets in 10 minutes, all in bursts at the polls. Every device must
 switch to mode 7, as the plan says.
 
-### Open points
+### Open points (status after the fixes of track E, simulation only: re-test on hardware)
 
-- `SWBB_INTERRUPT_WAKE`: header checks before the ACK (§3); stack headroom; throughput and fairness with several
-  transmitters in mode 7 (§6, step 4) and the acknowledged-not-received count.
+- **Header checks before the interrupt ACK (§3): fixed.** Both wake receivers (modes 1-6 and 7) now do the checks
+  `PJON::receive()` does before it acknowledges (`SoftwareBitBangAccept.h`); frames PJON would drop are neither
+  acknowledged nor stored. Reproduced in simulation (`accept_eval.sh`, 50 packets, modes 3 and 7): sender with packet
+  id / port / MAC, wake receiver without the matching `PJON_INCLUDE_*`: before 50 acknowledged, 0 delivered; after 0
+  acknowledged, 0 delivered. With the matching option and plain packets: 50 / 50 before and after.
+- **Interrupt ACK of a stuck application (§3): `SWBB_WAKE_ALIVE_MS`.** The interrupt acknowledges only if
+  `bus.receive()` ran in the last 100ms (default). A cleanly stuck application already stops acknowledging when its
+  queue is full (2 frames, unchanged). On hardware the node kept acknowledging, which means its queue state was
+  corrupted (stack overflow). Simulated by making the queue look empty after the application stops (`alive_eval.sh`):
+  before 150/150 acknowledged with nothing delivered after the stop; after acknowledgements stop within ~100ms (27 of
+  150 in mode 3, 46 in mode 7). Busy loops of 20 / 50 / 150ms between `bus.receive()` calls give the same results as
+  before (the queue limits them first).
+- **Stack headroom (§3): measured, partly reduced, check tool added.** Simulation (`stack_eval.sh`, receiver with a
+  15us interrupt every 256us): the INT0 interrupt uses 42 (1 frame) / 47 (2 frames) bytes of stack in modes 3 and 6,
+  40 / 42 in mode 7, nested interrupts included, on top of the application's stack at that moment. RAM of the wake
+  receiver: `SWBB_WAKE_FRAMES` x (`PJON_PACKET_MAX_LENGTH` + 2) + ~14 bytes; the 18 bytes of statistics are now only
+  compiled with `SWBB_WAKE_STATS` (mode 7: `SWBB_M7_STATS`, already optional). Splitting the interrupt in smaller
+  functions made it use more stack (+7 bytes), not less. Use `src/utils/PJON_StackCheck.h` on the real application
+  (`pjon_stack_paint()` first in `setup()`, `pjon_stack_free()` after heavy traffic; validated in simulation:
+  RAM + deepest stack + free = 2048). The largest saving is usually `PJON_MAX_PACKETS` (5 x (`PJON_PACKET_MAX_LENGTH`
+  + 13) bytes by default).
+- **Mode 7, two transmitters into one wake receiver (§6 step 4): acknowledged-but-not-received explained.**
+  `Mode7LinkTest` defined `MY_ID 1` for every transmitter. Two devices with the same id and the same payload counter
+  send identical frames; when they start together the frames do not collide electrically, the receiver stores one and
+  both transmitters see its acknowledgement. Reproduced with a 3 node simulation (`three.sh`, both transmitters id 1:
+  acknowledged 664, received 660 with a wake receiver, 650 / 649 with a polling one); with id 1 for both but different
+  payloads, or different ids: acknowledged = received in every run (modes 6 and 7, wake and polling receivers, with
+  +500ppm and +0.5% clock difference between the transmitters, 1000 packets each). `Mode7LinkTest` now takes `-DMY_ID`
+  and says each transmitter needs its own id. Re-test step 4 with different ids.
+- **Mode 7 unfairness between two saturating transmitters: explained, not changed.** Reproduced in simulation (e.g.
+  1:155 / 3:444 with a wake receiver). After each exchange both transmitters wait for the same idle bus; the one that
+  releases its preamble later wins the contention slot, and the code path after an acknowledgement and after a busy
+  bus differ by tens of microseconds, more than the random spread (0-16us delay + 0-28us slot), so the same
+  transmitter keeps winning. Larger random spreads (32 slots, 96us delay) changed the split but did not make it fair
+  and cost throughput. It only matters when two devices transmit back to back without retries; with
+  `send_packet_blocking` (back-off) and real traffic it averages out. A fair medium access would need a different
+  design (e.g. a random hold-off after every successful transmission).
 - Long cable: fall time, noise on the idle line with the pull-down, range.
 - Mode 7 bootloader on hardware.

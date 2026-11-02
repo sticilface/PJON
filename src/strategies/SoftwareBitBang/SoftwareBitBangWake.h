@@ -32,10 +32,14 @@
    - Other interrupt handlers up to ~25us (mode 3, 5, 6) or ~40us (mode 1)
      long, every 256us, do not disturb the reception (measured).
    - Acknowledged by the interrupt: frames with this device id (passed to
-     begin), acknowledgement requested, local mode, no extended length,
-     correct CRCs, and a free place in the queue. Not supported: shared mode
-     acknowledgements, router mode (acknowledging other device ids).
-     Frames not acknowledged by the interrupt are not acknowledged later.
+     begin), acknowledgement requested, correct CRCs, that PJON::receive()
+     would acknowledge (same header checks, see SoftwareBitBangAccept.h),
+     with a free place in the queue, if bus.receive() was called in the last
+     SWBB_WAKE_ALIVE_MS. Not supported: shared mode acknowledgements, MAC
+     addresses, router mode (acknowledging other device ids): such frames
+     are stored without acknowledgement. Frames PJON would drop are not
+     stored. Frames not acknowledged by the interrupt are not acknowledged
+     later.
    - If the queue is full new frames are ignored (not acknowledged, the
      transmitter retries).
    - Timer1 is not used. Timer0 is read (as by SWBB_PIN).
@@ -64,9 +68,27 @@
   #define SWBB_WAKE_FRAMES 2
 #endif
 
+/* The interrupt acknowledges a frame only if bus.receive() was called in
+   the last SWBB_WAKE_ALIVE_MS milliseconds (0: always): if the application
+   is stuck (or no longer calls bus.receive) its device stops acknowledging
+   and the transmitters see the failure, instead of being told that packets
+   are delivered. It must be longer than the longest time the application
+   spends between two bus.receive() calls. */
+#ifndef SWBB_WAKE_ALIVE_MS
+  #define SWBB_WAKE_ALIVE_MS 100
+#endif
+
+#include "SoftwareBitBangAccept.h"
+
 #ifndef SWBB_WAKE_QUIET
   #define SWBB_WAKE_QUIET \
     ((uint32_t)(SWBB_WIRE_PAD + (SWBB_WIRE_BIT * 9.5)))
+#endif
+
+#ifdef SWBB_WAKE_STATS
+  #define SWBB_WAKE_STAT(X) X
+#else
+  #define SWBB_WAKE_STAT(X)
 #endif
 
 namespace swbb_wake {
@@ -90,8 +112,11 @@ namespace swbb_wake {
   extern uint8_t id;
   extern uint8_t end;
   extern uint32_t last_rise;
-  extern volatile uint16_t wakes, stored, foreign, dropped;
-  extern volatile uint16_t failed_first, failed_init, failed_byte;
+  extern volatile uint32_t last_alive;
+  #ifdef SWBB_WAKE_STATS
+    extern volatile uint16_t wakes, stored, foreign, dropped, rejected, unalive;
+    extern volatile uint16_t failed_first, failed_init, failed_byte;
+  #endif
 #else
   #ifdef SWBB_WAKE_SHARED
     #define SWBB_WAKE_STORAGE
@@ -103,10 +128,14 @@ namespace swbb_wake {
   SWBB_WAKE_STORAGE uint8_t id = 0;
   SWBB_WAKE_STORAGE uint8_t end = 0;          // Timer0 count at the end of a byte
   SWBB_WAKE_STORAGE uint32_t last_rise = 0;   // micros() of the last rising edge
+  SWBB_WAKE_STORAGE volatile uint32_t last_alive = 0; // millis() of the last bus.receive()
 
-  // Statistics
-  SWBB_WAKE_STORAGE volatile uint16_t wakes = 0, stored = 0, foreign = 0, dropped = 0;
-  SWBB_WAKE_STORAGE volatile uint16_t failed_first = 0, failed_init = 0, failed_byte = 0;
+  // Statistics (define SWBB_WAKE_STATS to count, 18 bytes of RAM)
+  #ifdef SWBB_WAKE_STATS
+    SWBB_WAKE_STORAGE volatile uint16_t wakes = 0, stored = 0, foreign = 0, dropped = 0;
+    SWBB_WAKE_STORAGE volatile uint16_t rejected = 0, unalive = 0;
+    SWBB_WAKE_STORAGE volatile uint16_t failed_first = 0, failed_init = 0, failed_byte = 0;
+  #endif
 #endif
 
   /* CRC32 (IEEE 802.3) with a 16 entries table (~6us per byte at 16MHz) */
@@ -178,29 +207,31 @@ namespace swbb_wake {
     P::bus_release();
   }
 
-  /* Receives a frame, called by the interrupt with interrupts disabled */
-  static void receive() {
-    wakes++;
-    if(count >= SWBB_WAKE_FRAMES) { dropped++; return; }
+  /* Receives a frame, called by the interrupt with interrupts disabled.
+     Inlined in the interrupt: one call frame less on the stack, that the
+     interrupt adds to the application's (measured: see stack_eval.sh) */
+  static inline __attribute__((always_inline)) void receive() {
+    SWBB_WAKE_STAT(wakes++);
+    if(count >= SWBB_WAKE_FRAMES) { SWBB_WAKE_STAT(dropped++); return; }
     Frame &f = queue[(uint8_t)(head + count) % SWBB_WAKE_FRAMES];
-    if(!sync_first()) { failed_first++; return; }
+    if(!sync_first()) { SWBB_WAKE_STAT(failed_first++); return; }
     window();
-    if(!sync_next()) { failed_init++; return; }
+    if(!sync_next()) { SWBB_WAKE_STAT(failed_init++); return; }
     window();
-    if(!sync_next()) { failed_init++; return; }
+    if(!sync_next()) { SWBB_WAKE_STAT(failed_init++); return; }
     /* Between bytes only the byte is stored and the first bytes checked,
        so that other interrupts have most of the padding bit to run (two
        interrupt handlers can be served in the same padding bit) */
     uint8_t length = PJON_PACKET_MAX_LENGTH;
     for(uint8_t i = 0; i < length; i++) {
-      if(!sync_next()) { failed_byte++; return; }
+      if(!sync_next()) { SWBB_WAKE_STAT(failed_byte++); return; }
       uint8_t b = P::read_byte();
       end = TCNT0;
       sei(); // The next padding bit is being received
       f.data[i] = b;
       if(i == 0) {
         if((b != id) && (b != PJON_BROADCAST)) {
-          foreign++;
+          SWBB_WAKE_STAT(foreign++);
           cli();
           return; // Not for this device, its other bytes are ignored
         }
@@ -219,25 +250,38 @@ namespace swbb_wake {
        transmitter's response timeout (20us per byte) */
     sei();
     uint8_t header = f.data[1];
-    bool ack = (f.data[0] == id) && (header & PJON_ACK_REQ_BIT) &&
-      !(header & PJON_MODE_BIT) &&
-      (PJON_crc8::compute(f.data, 3) == f.data[3]);
-    if(ack) {
+    bool valid = PJON_crc8::compute(f.data, 3) == f.data[3];
+    if(valid) {
       if(header & PJON_CRC_BIT) {
         uint32_t c = 0xFFFFFFFF;
         for(uint8_t i = 0; i < length - 4; i++) c = crc32_update(c, f.data[i]);
         c = ~c;
         for(uint8_t i = length - 4; i < length; i++, c <<= 8)
-          if(f.data[i] != (uint8_t)(c >> 24)) ack = false;
+          if(f.data[i] != (uint8_t)(c >> 24)) valid = false;
       } else if(PJON_crc8::compute(f.data, length - 1) != f.data[length - 1])
-        ack = false;
+        valid = false;
     }
+    /* The same checks PJON::receive() does before acknowledging (see
+       SoftwareBitBangAccept.h): a frame PJON would drop is not acknowledged
+       and not stored */
+    uint8_t accept = valid ? swbb_accept(f.data, length) : SWBB_REJECT;
+    bool alive = !SWBB_WAKE_ALIVE_MS ||
+      ((uint32_t)(millis() - last_alive) <= SWBB_WAKE_ALIVE_MS);
     cli();
+    if(accept == SWBB_REJECT) { SWBB_WAKE_STAT(rejected++); return; }
+    bool requested = (f.data[0] == id) && (header & PJON_ACK_REQ_BIT);
+    bool ack = requested && (accept == SWBB_ACCEPT);
+    if(ack && !alive) {
+      /* Not acknowledged: the transmitter retries, storing it would deliver
+         it twice */
+      SWBB_WAKE_STAT(unalive++);
+      return;
+    }
     if(ack) acknowledge();
     f.length = length;
     f.acked = ack;
     count++;
-    stored++;
+    SWBB_WAKE_STAT(stored++);
   }
 }
 
@@ -246,6 +290,7 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
     bool begin(uint8_t did = 0) {
       SoftwareBitBangPolling::begin(did);
       swbb_wake::id = did;
+      swbb_wake::last_alive = millis();
       #ifdef SWBB_IRQ_PIN_DEBUG // PD3 high while the interrupt runs
         DDRD |= 8;
       #endif
@@ -261,6 +306,13 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
     uint16_t receive_frame(uint8_t *data, uint16_t max_length) {
       using namespace swbb_wake;
       if(max_length != PJON_PACKET_MAX_LENGTH) return SWBB_FAIL;
+      { // The application calls bus.receive() (atomic: read by the interrupt)
+        uint32_t now = millis();
+        uint8_t sreg = SREG;
+        cli();
+        last_alive = now;
+        SREG = sreg;
+      }
       if(!count) return SWBB_FAIL;
       Frame &f = queue[head];
       uint16_t length = f.length;

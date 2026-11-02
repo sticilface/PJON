@@ -10,7 +10,11 @@
    a packet received but not acknowledged means the response was lost.
 
    Change MODE to 6 or 3 to compare with the PJDL modes on the same cable.
-   For a busy bus, flash more transmitters (different MY_ID, same PEER). */
+   For a busy bus, flash more transmitters, each with its own MY_ID
+   (e.g. -DMY_ID=3, same PEER). Two transmitters with the same id send
+   identical frames when their counters match: if they start together the
+   receiver gets one frame and both transmitters see its acknowledgement
+   (acknowledged > received, as measured with two id 1 transmitters). */
 
 #ifndef MODE
   #define MODE 7
@@ -29,7 +33,9 @@
 #endif
 
 #ifdef TRANSMITTER
-  #define MY_ID 1
+  #ifndef MY_ID
+    #define MY_ID 1 // Unique for every transmitter
+  #endif
   #define PEER  2
 #else
   #define MY_ID 2
@@ -54,7 +60,11 @@ void setup() {
   bus.begin();
   Serial.print("Mode ");
   Serial.print(MODE);
-  Serial.println(MY_ID == 1 ? " transmitter" : " receiver");
+  #ifdef TRANSMITTER
+    Serial.println(" transmitter");
+  #else
+    Serial.println(" receiver");
+  #endif
 }
 
 void loop() {

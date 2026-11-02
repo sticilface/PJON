@@ -33,6 +33,10 @@ Requirements: `apt install gcc-avr avr-libc binutils-avr libsimavr-dev libelf-de
 | `./mega_eval.sh <O\|P\|F\|W> "<modes>" [ideal\|cable]` | ATmega2560 (pin 3) with ATmega328P (pin 2) nodes, every direction (`PAIRS`), `IMPL_U` for another implementation on the 328P, `EXTRA_M`/`EXTRA_U` for extra flags. |
 | `./mega_load.sh [load\|busy]` | Interrupt load and busy loops on the Mega. |
 | `./mega_size.sh`, `./mega_compile.sh` | Flash/RAM on both MCUs, compile check of every MCU / pin / implementation / mode. |
+| `./three.sh "<tx flags>" "<rx flags>"`, `./three_eval.sh <mode> <tx> <rx>` | Three devices (`swbb_sim -c`): two transmitters (ids 1 and 3, `TX2_ID` to change the second) sending back to back to one receiver: fairness, acknowledged vs received per sender. `SIM_FLAGS="-G 16008000"` gives the second transmitter a 500ppm faster clock. |
+| `./accept_eval.sh [modes]` | Wake receiver acknowledgements match what PJON accepts (packet id, port, MAC with and without the `PJON_INCLUDE_*` option). `LIB=<src dir>` runs it on another library version. |
+| `./alive_eval.sh [modes]` | `SWBB_WAKE_ALIVE_MS`: the receiver's application stops calling `bus.receive()` (also with the queue looking empty, as after a stack overflow); busy loops of 20/50/150ms. |
+| `./stack_eval.sh` | Static RAM, deepest stack use, stack used by the INT0 interrupt (nested interrupts included) and `pjon_stack_free()`, for polling and wake receivers with 1 and 2 frames (`swbb_sim -S`). |
 | `./bench.sh [modes]` | CPU time taken polling an idle bus, duration of `can_start()`, and how often `can_start()` wrongly reports the bus free while another device is waiting for a response (keep busy bits). |
 
 The simulator (`swbb_sim.c`) drives the bus pin through the simavr port IRQ, so pin change and external interrupts work, traces PD3 of B (`-e`) and reports bus contention: one device driving the bus high while the other drives it low.

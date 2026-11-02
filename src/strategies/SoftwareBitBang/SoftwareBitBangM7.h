@@ -390,6 +390,12 @@ namespace swbb_m7 {
   #ifndef SWBB_WAKE_FRAMES
     #define SWBB_WAKE_FRAMES 2
   #endif
+  /* Acknowledge only if bus.receive() ran in the last SWBB_WAKE_ALIVE_MS
+     milliseconds, 0: always (see SoftwareBitBangWake.h) */
+  #ifndef SWBB_WAKE_ALIVE_MS
+    #define SWBB_WAKE_ALIVE_MS 100
+  #endif
+  #include "SoftwareBitBangAccept.h"
   /* Rising edges closer than this to the previous one are inside a frame or
      an exchange (byte starts every 10T + window, keep busy pulses) */
   #ifndef SWBB_M7_QUIET
@@ -406,7 +412,10 @@ namespace swbb_m7 {
     SWBB_STATE(volatile uint8_t count, 0);
     SWBB_STATE(uint8_t id, 0);
     SWBB_STATE(uint32_t last_rise, 0);
+    SWBB_STATE(volatile uint32_t last_alive, 0);
     #ifdef SWBB_M7_STATS
+      SWBB_STATE(volatile uint16_t rejected, 0);
+      SWBB_STATE(volatile uint16_t unalive, 0);
       SWBB_STATE(volatile uint16_t wakes, 0);
       SWBB_STATE(volatile uint16_t stored, 0);
       SWBB_STATE(volatile uint16_t failed, 0);
@@ -424,15 +433,23 @@ namespace swbb_m7 {
       if(!length) { SWBB_M7_STAT(failed++); return; }
       sei(); // CRC check with interrupts enabled
       bool valid = frame_valid(f.data, length);
+      /* The same checks PJON::receive() does before acknowledging (see
+         SoftwareBitBangAccept.h): a frame PJON would drop is not
+         acknowledged and not stored */
+      uint8_t accept = valid ? swbb_accept(f.data, length) : SWBB_REJECT;
+      bool alive = !SWBB_WAKE_ALIVE_MS ||
+        ((uint32_t)(millis() - last_alive) <= SWBB_WAKE_ALIVE_MS);
       cli();
       // Not valid: not acknowledged, the transmitter retries
       if(!valid) { SWBB_M7_STAT(failed++); return; }
+      if(accept == SWBB_REJECT) { SWBB_M7_STAT(rejected++); return; }
       /* Acknowledged here (PJON reads the frame later): this device id,
-         requested, local mode (shared mode and router mode not supported) */
-      if(
-        (f.data[0] == id) && (f.data[1] & PJON_ACK_REQ_BIT) &&
-        !(f.data[1] & PJON_MODE_BIT)
-      ) tx_response(PJON_ACK);
+         requested, accepted by PJON's checks (shared mode, MAC and router
+         mode not supported: stored without acknowledgement) */
+      bool ack = (f.data[0] == id) && (f.data[1] & PJON_ACK_REQ_BIT) &&
+        (accept == SWBB_ACCEPT);
+      if(ack && !alive) { SWBB_M7_STAT(unalive++); return; }
+      if(ack) tx_response(PJON_ACK);
       f.length = length;
       count++;
       SWBB_M7_STAT(stored++);
@@ -448,6 +465,7 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
       P::begin(did);
       #ifdef SWBB_INTERRUPT_WAKE
         swbb_m7::id = did;
+        swbb_m7::last_alive = millis();
         SWBB_EXT_INT_EICR |= SWBB_M7_WAKE_SENSE;
         irq_on();
       #endif
@@ -475,6 +493,13 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
       if(max_length != PJON_PACKET_MAX_LENGTH) return SWBB_FAIL;
       #ifdef SWBB_INTERRUPT_WAKE
         using namespace swbb_m7;
+        { // The application calls bus.receive() (atomic: read by the interrupt)
+          uint32_t now = millis();
+          uint8_t sreg = SREG;
+          cli();
+          last_alive = now;
+          SREG = sreg;
+        }
         if(!count) return SWBB_FAIL;
         Frame &f = queue[head];
         uint16_t length = f.length;
