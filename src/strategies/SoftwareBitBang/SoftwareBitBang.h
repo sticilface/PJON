@@ -44,7 +44,8 @@
   #define SWBB_RECEIVE_TIME 1000
 #endif
 
-/* Direct port access (optional, ATmega88/168/328/328P/328PB only)
+/* Direct port access (optional, ATmega88/168/328/328P/328PB and
+   ATmega1280/2560, see SoftwareBitBangAVRPins.h for the pins)
    Define SWBB_PIN before including PJON to select the pin at compile time:
      #define SWBB_PIN 2
      #include <PJONSoftwareBitBang.h>
@@ -62,30 +63,7 @@
    enabled (not recommended: an interrupt during a byte corrupts it). */
 
 #ifdef SWBB_PIN
-  #if !defined(__AVR_ATmega88__)  && !defined(__AVR_ATmega88P__)  && \
-      !defined(__AVR_ATmega168__) && !defined(__AVR_ATmega168P__) && \
-      !defined(__AVR_ATmega328__) && !defined(__AVR_ATmega328P__) && \
-      !defined(__AVR_ATmega328PB__)
-    #error "SWBB_PIN (direct port access) supports only ATmega88/168/328"
-  #endif
-  #if SWBB_PIN >= 0 && SWBB_PIN <= 7
-    #define SWBB_PORT PORTD
-    #define SWBB_DDR  DDRD
-    #define SWBB_IN   PIND
-    #define SWBB_BIT  (SWBB_PIN)
-  #elif SWBB_PIN >= 8 && SWBB_PIN <= 13
-    #define SWBB_PORT PORTB
-    #define SWBB_DDR  DDRB
-    #define SWBB_IN   PINB
-    #define SWBB_BIT  (SWBB_PIN - 8)
-  #elif SWBB_PIN >= 14 && SWBB_PIN <= 19
-    #define SWBB_PORT PORTC
-    #define SWBB_DDR  DDRC
-    #define SWBB_IN   PINC
-    #define SWBB_BIT  (SWBB_PIN - 14)
-  #else
-    #error "SWBB_PIN must be an Arduino pin number between 0 and 19"
-  #endif
+  #include "SoftwareBitBangAVRPins.h"
   #ifndef SWBB_ATOMIC
     #define SWBB_ATOMIC 1
   #endif
@@ -130,6 +108,26 @@
     #error "Define either SWBB_INTERRUPT or SWBB_INTERRUPT_WAKE"
   #endif
   #define SoftwareBitBang SoftwareBitBangPolling
+#endif
+
+/* Frame hooks (direct port access implementations, empty by default).
+   SWBB_FRAME_BEGIN() and SWBB_FRAME_END() are called around:
+   - the reception of a frame by the interrupt of SWBB_INTERRUPT_WAKE (and
+     mode 7 with SWBB_INTERRUPT_WAKE), from its first rising edge until the
+     frame is stored and acknowledged, or discarded;
+   - send_frame, receive_response and send_response of SWBB_PIN (polling
+     reception, frame by frame through bus.receive(), is not covered).
+   They run with interrupts disabled or inside the interrupt and must be
+   short, e.g. to drive a project's own busy line on a fixed pin:
+     #define SWBB_FRAME_BEGIN() (PORTB |= _BV(PB0))
+     #define SWBB_FRAME_END()   (PORTB &= ~_BV(PB0))
+   Begin and end calls are always paired. */
+
+#ifndef SWBB_FRAME_BEGIN
+  #define SWBB_FRAME_BEGIN()
+#endif
+#ifndef SWBB_FRAME_END
+  #define SWBB_FRAME_END()
 #endif
 
 class SoftwareBitBang {
@@ -445,6 +443,14 @@ class SoftwareBitBang {
        to the response timeout. The response is prepended by 2 sync pads. */
 
     uint16_t receive_response() {
+      SWBB_FRAME_BEGIN();
+      uint16_t result = receive_response_();
+      SWBB_FRAME_END();
+      return result;
+    };
+
+
+    uint16_t receive_response_() {
       uint32_t time = PJON_MICROS();
       while((uint32_t)(PJON_MICROS() - time) < _timeout) {
         uint8_t sreg = atomic_begin();
@@ -524,6 +530,13 @@ class SoftwareBitBang {
        additional synchronization pad. */
 
     void send_response(uint8_t response) {
+      SWBB_FRAME_BEGIN();
+      send_response_(response);
+      SWBB_FRAME_END();
+    };
+
+
+    void send_response_(uint8_t response) {
       bus_release();
       uint8_t sreg = atomic_begin();
       wait_while_low(SWBB_LOOPS(SWBB_RESPONSE_PULSE_WAIT));
@@ -550,6 +563,13 @@ class SoftwareBitBang {
     /* Send a frame: preamble, frame initializer and data */
 
     void send_frame(uint8_t *data, uint16_t length) {
+      SWBB_FRAME_BEGIN();
+      send_frame_(data, length);
+      SWBB_FRAME_END();
+    };
+
+
+    void send_frame_(uint8_t *data, uint16_t length) {
       _timeout = (length * SWBB_RESPONSE_OFFSET) + SWBB_LATENCY;
       #if SWBB_PREAMBLE != 1
         /* Long preamble, transmitted with interrupts enabled. Its duration

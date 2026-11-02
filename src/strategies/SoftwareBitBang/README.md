@@ -83,7 +83,8 @@ Before including the library it is possible to configure `SoftwareBitBang` using
 | `SWBB_MAX_ATTEMPTS`     | Maximum transmission attempts        | Numeric value (20 by default)              |
 | `SWBB_PREAMBLE`         | Preamble Length                      | Numeric value (1 by default), max 100      |
 | `SWBB_MAX_PREAMBLE`     | Maximum preamble length              | Numeric value (1 by default), max 100      |
-| `SWBB_PIN`              | Direct port access on this pin (ATmega88/168/328 only, see below) | Arduino pin number 0-19 |
+| `SWBB_PIN`              | Direct port access on this pin (ATmega88/168/328 and ATmega1280/2560, see below) | Arduino pin number (328P: 0-19, Mega: ports A-G) |
+| `SWBB_FRAME_BEGIN()` / `SWBB_FRAME_END()` | Called around each frame by the direct port access code, e.g. to drive a project's busy line (see below) | Short statements |
 | `SWBB_ATOMIC`           | With `SWBB_PIN`, disable interrupts while a byte is transmitted or received | 1 (default) or 0 |
 
 `SoftwareBitBang` supports the use of input and output pins because separated signals may be required if additional circuitry is used for amplification or noise filtering. It also works if pins are directly connected as a simple point-to-point null-modem or cross-over serial link.
@@ -102,7 +103,7 @@ void setup() {
 ```
 After the PJON object is defined with its strategy, it is possible to set the communication pin by accessing the strategy present in the PJON instance. All the other necessary information is present in the general [Documentation](/documentation).
 
-### Direct port access (ATmega88/168/328)
+### Direct port access (ATmega88/168/328, ATmega1280/2560)
 On the ATmega88/168/328 (Arduino Uno, Nano, Pro Mini) the pin can be selected at compile time defining `SWBB_PIN` before including the library. The pin is then read and written with single instructions instead of `digitalRead`, `digitalWrite` and `pinMode`, as the [bootloader](/bootloader/SoftwareBitBang/ATmega328P) does, and the timing is cycle exact:
 ```cpp
 #define SWBB_MODE 3
@@ -127,6 +128,18 @@ With `SWBB_PIN 2` (INT0) or `3` (INT1), defining `SWBB_INTERRUPT_WAKE` makes the
 - Frames that find the queue full are not acknowledged. Call `bus.receive()` regularly, also inside loops that only transmit: two devices sending to each other back to back without it fill each other's queue and both keep retrying (seen on hardware). `send_packet_blocking` receives during its back-off only with `PJON_RECEIVE_WHILE_SENDING_BLOCKING`.
 - Projects with several source files that include PJON (not a single sketch): define `SWBB_WAKE_SHARED` for all of them and `SWBB_WAKE_IMPLEMENTATION` in exactly one (e.g. with `-D` build flags for the first, `#define` before the include for the second). Only that file then defines the interrupt handler and the receiver's state, otherwise the link fails with a duplicate `__vector_1`. The same applies to `SWBB_INTERRUPT` and to mode 7.
 - See [REVIEW-swbb-interrupt-wake.md](/REVIEW-swbb-interrupt-wake.md) for the measurements.
+
+#### ATmega1280/2560 (Arduino Mega)
+`SWBB_PIN` works on the Mega on the pins of ports A-G: 0-5, 10-13, 18-41, 50-61 (A0-A7); ports H, J, K and L (pins 6-9, 14-17, 42-49, 62-69) are rejected at compile time. The wake receivers need a pin with an external interrupt: 2 (INT4), 3 (INT5), 18-21 (INT3-INT0). The timing is cycle exact as on the 328P, so a Mega and 328P nodes work together in every mode, also with nodes on the original library in modes 1-4. With the original library a Mega on pin 3 (a PWM pin) transmits and samples data bits far longer than a 328P in mode 3 and can not communicate with it at all: see [REVIEW-swbb-mega2560.md](/REVIEW-swbb-mega2560.md).
+
+#### Frame hooks
+`SWBB_FRAME_BEGIN()` and `SWBB_FRAME_END()` (empty by default) are called around the reception of a frame by the interrupt of `SWBB_INTERRUPT_WAKE` (PJDL modes and mode 7) and around `send_frame`, `receive_response` and `send_response` of `SWBB_PIN`, always in pairs, with interrupts disabled or inside the interrupt. Keep them short, for example to drive a busy line that tells an I2C master not to address the device while a frame is received:
+```cpp
+#define SWBB_FRAME_BEGIN() (PORTB |= _BV(PB0))
+#define SWBB_FRAME_END()   (PORTB &= ~_BV(PB0))
+#include <PJONSoftwareBitBang.h>
+```
+Polling reception (`bus.receive()` without the wake receiver) is not covered, and mode 7's polling code does not call them.
 
 ### Why not interrupts?
 In the Arduino environment the use of libraries is really extensive and often the end user is not able to go over collisions. Very often a library is using hardware resources of the microcontroller, colliding with other libraries. This happens because in general Arduino boards have limited hardware resources. Software-defined bit-banging, is a stable and reliable solution that leads to "more predictable" results than interrupt driven procedures coexisting on limited microcontrollers without the developer and the end user knowing about it.

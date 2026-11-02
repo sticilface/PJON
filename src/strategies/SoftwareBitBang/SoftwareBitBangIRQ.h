@@ -47,21 +47,14 @@
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 
-#if SWBB_PIN == 2
-  #define SWBB_IRQ_VECT   INT0_vect
-  #define SWBB_IRQ_ENABLE (1 << INT0)
-  #define SWBB_IRQ_FLAG   (1 << INTF0)
-  #define SWBB_IRQ_SENSE  (1 << ISC00) // Any logical change
-  #define SWBB_IRQ_SENSE_MASK ((1 << ISC01) | (1 << ISC00))
-#elif SWBB_PIN == 3
-  #define SWBB_IRQ_VECT   INT1_vect
-  #define SWBB_IRQ_ENABLE (1 << INT1)
-  #define SWBB_IRQ_FLAG   (1 << INTF1)
-  #define SWBB_IRQ_SENSE  (1 << ISC10)
-  #define SWBB_IRQ_SENSE_MASK ((1 << ISC11) | (1 << ISC10))
-#else
-  #error "SWBB_INTERRUPT requires SWBB_PIN 2 (INT0) or 3 (INT1)"
+#ifndef SWBB_EXT_INT_VECT
+  #error "SWBB_INTERRUPT requires a SWBB_PIN with an external interrupt (2 or 3; on the Mega also 18-21)"
 #endif
+#define SWBB_IRQ_VECT   SWBB_EXT_INT_VECT
+#define SWBB_IRQ_ENABLE SWBB_EXT_INT_ENABLE
+#define SWBB_IRQ_FLAG   SWBB_EXT_INT_FLAG
+#define SWBB_IRQ_SENSE  SWBB_EXT_INT_SENSE_CHANGE
+#define SWBB_IRQ_SENSE_MASK SWBB_EXT_INT_SENSE_MASK
 
 // Microseconds to Timer1 ticks (F_CPU / 8)
 #define SWBB_T1(US) ((uint16_t)((US) * (F_CPU / 8000000.0)))
@@ -346,7 +339,8 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
       #ifdef SWBB_IRQ_PIN_DEBUG // PD3 high while the interrupts run
         DDRD |= 8;
       #endif
-      EICRA = (EICRA & ~SWBB_IRQ_SENSE_MASK) | SWBB_IRQ_SENSE;
+      SWBB_EXT_INT_EICR =
+        (SWBB_EXT_INT_EICR & ~SWBB_IRQ_SENSE_MASK) | SWBB_IRQ_SENSE;
       irq_on();
       return true;
     };

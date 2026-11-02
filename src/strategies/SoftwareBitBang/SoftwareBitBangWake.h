@@ -51,21 +51,14 @@
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 
-#if SWBB_PIN == 2
-  #define SWBB_WAKE_VECT   INT0_vect
-  #define SWBB_WAKE_ENABLE (1 << INT0)
-  #define SWBB_WAKE_FLAG   (1 << INTF0)
-  #define SWBB_WAKE_SENSE  ((1 << ISC01) | (1 << ISC00)) // Rising edge
-  #define SWBB_WAKE_SENSE_MASK ((1 << ISC01) | (1 << ISC00))
-#elif SWBB_PIN == 3
-  #define SWBB_WAKE_VECT   INT1_vect
-  #define SWBB_WAKE_ENABLE (1 << INT1)
-  #define SWBB_WAKE_FLAG   (1 << INTF1)
-  #define SWBB_WAKE_SENSE  ((1 << ISC11) | (1 << ISC10))
-  #define SWBB_WAKE_SENSE_MASK ((1 << ISC11) | (1 << ISC10))
-#else
-  #error "SWBB_INTERRUPT_WAKE requires SWBB_PIN 2 (INT0) or 3 (INT1)"
+#ifndef SWBB_EXT_INT_VECT
+  #error "SWBB_INTERRUPT_WAKE requires a SWBB_PIN with an external interrupt (2 or 3; on the Mega also 18-21)"
 #endif
+#define SWBB_WAKE_VECT   SWBB_EXT_INT_VECT
+#define SWBB_WAKE_ENABLE SWBB_EXT_INT_ENABLE
+#define SWBB_WAKE_FLAG   SWBB_EXT_INT_FLAG
+#define SWBB_WAKE_SENSE  SWBB_EXT_INT_SENSE_RISING
+#define SWBB_WAKE_SENSE_MASK SWBB_EXT_INT_SENSE_MASK
 
 #ifndef SWBB_WAKE_FRAMES
   #define SWBB_WAKE_FRAMES 2
@@ -256,7 +249,8 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
       #ifdef SWBB_IRQ_PIN_DEBUG // PD3 high while the interrupt runs
         DDRD |= 8;
       #endif
-      EICRA = (EICRA & ~SWBB_WAKE_SENSE_MASK) | SWBB_WAKE_SENSE;
+      SWBB_EXT_INT_EICR =
+        (SWBB_EXT_INT_EICR & ~SWBB_WAKE_SENSE_MASK) | SWBB_WAKE_SENSE;
       irq_on();
       return true;
     };
@@ -340,7 +334,9 @@ ISR(SWBB_WAKE_VECT) {
   last_rise = now;
   if(gap >= SWBB_WAKE_QUIET) { // Not inside a frame or an exchange
     EIMSK &= ~SWBB_WAKE_ENABLE; // No re-entry while nested
+    SWBB_FRAME_BEGIN();
     receive();
+    SWBB_FRAME_END();
     last_rise = PJON_MICROS();
     EIFR = SWBB_WAKE_FLAG;
     EIMSK |= SWBB_WAKE_ENABLE;

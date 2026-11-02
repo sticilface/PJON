@@ -1,8 +1,9 @@
-/* Simulation of two ATmega328P running PJON SoftwareBitBang sketches on a
+/* Simulation of two ATmega328P (or ATmega2560, see -M) running PJON SoftwareBitBang sketches on a
    single wire bus (used to test SoftwareBitBang itself, see run_swbb_tests.sh)
 
    Usage: swbb_sim -a nodeA.hex -b nodeB.hex [options]
-     -B pin      bus pin, Arduino numbering (default 2)
+     -B pin[,pin] bus pin of A[,B], Arduino numbering of each MCU (default 2)
+     -M mcu[,mcu] MCU of A[,B]: atmega328p (default) or atmega2560
      -t seconds  maximum simulated time (default 10)
      -e          print every bus level change (microseconds, who drives)
      -C pF       analog bus model: total bus capacitance (cable + pins), the
@@ -32,20 +33,46 @@
 #include <simavr/avr_uart.h>
 #include <simavr/avr_ioport.h>
 
-#define MCU "atmega328p"
-
 static avr_t *node[2];
-static int pin_reg, ddr_reg, port_reg, mask, bus_bit;
-static char bus_port;
+/* Per node bus pin: data space addresses of PINx (DDRx, PORTx follow) */
+static int pin_reg[2], ddr_reg[2], port_reg[2], mask[2], bus_bit[2];
+static char bus_port[2];
 static avr_irq_t *pin_irq[2];
+
+/* Arduino pin number -> port letter and bit (-1 if unknown) */
+static int map_pin(const char *mcu, int pin, char *port, int *bit) {
+  if(!strcmp(mcu, "atmega2560")) {
+    /* Arduino Mega variant (pins_arduino.h of the Arduino AVR core) */
+    static const char ports[] =
+      "EEEEGEHHHHBBBBJJHHDDDDAAAAAAAACCCCCCCCDGGGLLLLLLLLBBBBFFFFFFFFKKKKKKKK";
+    static const int bits[] = {
+      0,1,4,5,5,3,3,4,5,6,4,5,6,7,1,0,1,0,3,2,1,0,0,1,2,3,4,5,6,7,
+      7,6,5,4,3,2,1,0,7,2,1,0,7,6,5,4,3,2,1,0,3,2,1,0,
+      0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7};
+    if(pin < 0 || pin > 69) return -1;
+    *port = ports[pin]; *bit = bits[pin]; return 0;
+  }
+  if(pin < 0 || pin > 19) return -1;
+  if(pin <= 7) { *port = 'D'; *bit = pin; }
+  else if(pin <= 13) { *port = 'B'; *bit = pin - 8; }
+  else { *port = 'C'; *bit = pin - 14; }
+  return 0;
+}
+
+static int pin_address(char port) {
+  static const char order[] = "ABCDEFG";
+  const char *p = strchr(order, port);
+  if(p) return 0x20 + 3 * (int)(p - order);
+  return 0x100 + 3 * (int)(strchr("HJKL", port) - "HJKL");
+}
 
 /* Sets the bus level seen by a node: through the port pin IRQ, so that pin
    change and external interrupts (INT0/INT1) are triggered */
 static void set_level(int n, int level) {
   avr_t *a = node[n];
   if(pin_irq[n]->value != (uint32_t)level) avr_raise_irq(pin_irq[n], level);
-  if(level) a->data[pin_reg] |= mask;
-  else a->data[pin_reg] &= ~mask;
+  if(level) a->data[pin_reg[n]] |= mask[n];
+  else a->data[pin_reg[n]] &= ~mask[n];
 }
 static char line[2][256];
 static int line_len[2], done[2], stamp = 0;
@@ -79,11 +106,14 @@ static void uart_out(struct avr_irq_t *irq, uint32_t value, void *param) {
   line[n][line_len[n]++] = c;
 }
 
+static int node_index(avr_t *a) { return a == node[1]; }
 static int drives_high(avr_t *a) {
-  return (a->data[ddr_reg] & mask) && (a->data[port_reg] & mask);
+  int n = node_index(a);
+  return (a->data[ddr_reg[n]] & mask[n]) && (a->data[port_reg[n]] & mask[n]);
 }
 static int drives_low(avr_t *a) {
-  return (a->data[ddr_reg] & mask) && !(a->data[port_reg] & mask);
+  int n = node_index(a);
+  return (a->data[ddr_reg[n]] & mask[n]) && !(a->data[port_reg[n]] & mask[n]);
 }
 
 /* Histogram of pulse durations (0.5us buckets) per driver and level */
@@ -92,15 +122,27 @@ static uint32_t hist[3][2][HMAX];
 
 int main(int argc, char **argv) {
   const char *hex[2] = {NULL, NULL};
-  int bus_pin = 2, trace = 0, histo = 0, opt;
+  int bus_pin[2] = {2, 2}, trace = 0, histo = 0, opt;
+  char mcu[2][16] = {"atmega328p", "atmega328p"};
   long b_reset = -1, b_frequency = 16000000;
   double max_seconds = 10;
   double cap_pf = 0, r_series = 100, r_pull = 100000;
-  while((opt = getopt(argc, argv, "a:b:B:t:ehr:F:TC:R:P:")) != -1) {
+  while((opt = getopt(argc, argv, "a:b:B:M:t:ehr:F:TC:R:P:")) != -1) {
     switch(opt) {
       case 'a': hex[0] = optarg; break;
       case 'b': hex[1] = optarg; break;
-      case 'B': bus_pin = atoi(optarg); break;
+      case 'B': {
+        char *c = strchr(optarg, ',');
+        bus_pin[0] = bus_pin[1] = atoi(optarg);
+        if(c) bus_pin[1] = atoi(c + 1);
+        break;
+      }
+      case 'M': {
+        char *c = strchr(optarg, ',');
+        snprintf(mcu[0], 16, "%.*s", c ? (int)(c - optarg) : 15, optarg);
+        snprintf(mcu[1], 16, "%s", c ? c + 1 : mcu[0]);
+        break;
+      }
       case 't': max_seconds = atof(optarg); break;
       case 'e': trace = 1; break;
       case 'T': stamp = 1; break;
@@ -115,15 +157,20 @@ int main(int argc, char **argv) {
   }
   if(!hex[0] || !hex[1]) return 2;
   setvbuf(stdout, NULL, _IONBF, 0);
-  if(bus_pin <= 7) { pin_reg = 0x29; bus_bit = bus_pin; bus_port = 'D'; }
-  else if(bus_pin <= 13) { pin_reg = 0x23; bus_bit = bus_pin - 8; bus_port = 'B'; }
-  else { pin_reg = 0x26; bus_bit = bus_pin - 14; bus_port = 'C'; }
-  mask = 1 << bus_bit;
-  ddr_reg = pin_reg + 1;
-  port_reg = pin_reg + 2;
+  for(int n = 0; n < 2; n++) {
+    if(map_pin(mcu[n], bus_pin[n], &bus_port[n], &bus_bit[n])) {
+      fprintf(stderr, "unknown pin %d on %s\n", bus_pin[n], mcu[n]);
+      return 2;
+    }
+    pin_reg[n] = pin_address(bus_port[n]);
+    mask[n] = 1 << bus_bit[n];
+    ddr_reg[n] = pin_reg[n] + 1;
+    port_reg[n] = pin_reg[n] + 2;
+  }
 
   for(int n = 0; n < 2; n++) {
-    node[n] = avr_make_mcu_by_name(MCU);
+    node[n] = avr_make_mcu_by_name(mcu[n]);
+    if(!node[n]) { fprintf(stderr, "unknown MCU %s\n", mcu[n]); return 2; }
     avr_init(node[n]);
     node[n]->frequency = 16000000;
     node[n]->log = LOG_WARNING;
@@ -135,7 +182,7 @@ int main(int argc, char **argv) {
         done[1] = 1;
       }
     }
-    pin_irq[n] = avr_io_getirq(node[n], AVR_IOCTL_IOPORT_GETIRQ(bus_port), bus_bit);
+    pin_irq[n] = avr_io_getirq(node[n], AVR_IOCTL_IOPORT_GETIRQ(bus_port[n]), bus_bit[n]);
     avr_irq_t *irq = avr_io_getirq(node[n], AVR_IOCTL_UART_GETIRQ('0'),
       UART_IRQ_OUTPUT);
     avr_irq_register_notify(irq, uart_out, (void *)(intptr_t)n);

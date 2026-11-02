@@ -1,6 +1,6 @@
 ## SoftwareBitBang simulation tests
 
-Two simulated ATmega328P at 16MHz ([simavr](https://github.com/buserror/simavr)) connected by a single wire bus, running PJON SoftwareBitBang sketches compiled with avr-g++ and the minimal Arduino core of `../arduino`. They compare three implementations:
+Two simulated ATmega328P (or ATmega2560: `swbb_sim -M`, `MCU_A`/`MCU_B`, `PIN_A`/`PIN_B` in `run_swbb_tests.sh`) at 16MHz ([simavr](https://github.com/buserror/simavr)) connected by a single wire bus, running PJON SoftwareBitBang sketches compiled with avr-g++ and the minimal Arduino core of `../arduino`. They compare three implementations:
 
 - `O`: the original library (`src` of git `ORIG_REF`, default `master`)
 - `P`: this library, portable implementation (`digitalRead`, `digitalWrite`, `pinMode`)
@@ -30,6 +30,9 @@ Requirements: `apt install gcc-avr avr-libc binutils-avr libsimavr-dev libelf-de
 | `./m7_load.sh`, `./m7_gap.sh` | Mode 7 under interrupt load (handler every 256us on both devices), interrupt window length. |
 | `./m7_collide.sh` | Both devices transmitting to each other at the same time (modes 3, 6, 7, 7 wake). |
 | `./m7_boot.sh` | Mode 7 uploader to bootloader link (200 chunks), bootloader at 16/8MHz. |
+| `./mega_eval.sh <O\|P\|F\|W> "<modes>" [ideal\|cable]` | ATmega2560 (pin 3) with ATmega328P (pin 2) nodes, every direction (`PAIRS`), `IMPL_U` for another implementation on the 328P, `EXTRA_M`/`EXTRA_U` for extra flags. |
+| `./mega_load.sh [load\|busy]` | Interrupt load and busy loops on the Mega. |
+| `./mega_size.sh`, `./mega_compile.sh` | Flash/RAM on both MCUs, compile check of every MCU / pin / implementation / mode. |
 | `./bench.sh [modes]` | CPU time taken polling an idle bus, duration of `can_start()`, and how often `can_start()` wrongly reports the bus free while another device is waiting for a response (keep busy bits). |
 
 The simulator (`swbb_sim.c`) drives the bus pin through the simavr port IRQ, so pin change and external interrupts work, traces PD3 of B (`-e`) and reports bus contention: one device driving the bus high while the other drives it low.

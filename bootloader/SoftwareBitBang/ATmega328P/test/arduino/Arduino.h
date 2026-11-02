@@ -22,12 +22,21 @@
 #define OUTPUT 0x1
 #define INPUT_PULLUP 0x2
 
+#if defined(__AVR_ATmega2560__) || defined(__AVR_ATmega1280__)
+#define A0 54
+#define A1 55
+#define A2 56
+#define A3 57
+#define A4 58
+#define A5 59
+#else
 #define A0 14
 #define A1 15
 #define A2 16
 #define A3 17
 #define A4 18
 #define A5 19
+#endif
 #define LED_BUILTIN 13
 
 typedef uint8_t byte;

@@ -380,19 +380,13 @@ namespace swbb_m7 {
    implementations share the frame code above */
 
 #ifdef SWBB_INTERRUPT_WAKE
-  #if SWBB_PIN == 2
-    #define SWBB_M7_WAKE_VECT   INT0_vect
-    #define SWBB_M7_WAKE_ENABLE (1 << INT0)
-    #define SWBB_M7_WAKE_FLAG   (1 << INTF0)
-    #define SWBB_M7_WAKE_SENSE  ((1 << ISC01) | (1 << ISC00))
-  #elif SWBB_PIN == 3
-    #define SWBB_M7_WAKE_VECT   INT1_vect
-    #define SWBB_M7_WAKE_ENABLE (1 << INT1)
-    #define SWBB_M7_WAKE_FLAG   (1 << INTF1)
-    #define SWBB_M7_WAKE_SENSE  ((1 << ISC11) | (1 << ISC10))
-  #else
-    #error "SWBB_INTERRUPT_WAKE requires SWBB_PIN 2 (INT0) or 3 (INT1)"
+  #ifndef SWBB_EXT_INT_VECT
+    #error "SWBB_INTERRUPT_WAKE requires a SWBB_PIN with an external interrupt (2 or 3; on the Mega also 18-21)"
   #endif
+  #define SWBB_M7_WAKE_VECT   SWBB_EXT_INT_VECT
+  #define SWBB_M7_WAKE_ENABLE SWBB_EXT_INT_ENABLE
+  #define SWBB_M7_WAKE_FLAG   SWBB_EXT_INT_FLAG
+  #define SWBB_M7_WAKE_SENSE  SWBB_EXT_INT_SENSE_RISING
   #ifndef SWBB_WAKE_FRAMES
     #define SWBB_WAKE_FRAMES 2
   #endif
@@ -454,7 +448,7 @@ class SoftwareBitBang : public SoftwareBitBangPolling {
       P::begin(did);
       #ifdef SWBB_INTERRUPT_WAKE
         swbb_m7::id = did;
-        EICRA |= SWBB_M7_WAKE_SENSE;
+        SWBB_EXT_INT_EICR |= SWBB_M7_WAKE_SENSE;
         irq_on();
       #endif
       return true;
@@ -604,7 +598,9 @@ ISR(SWBB_M7_WAKE_VECT) {
   last_rise = now;
   if(gap >= SWBB_M7_QUIET) { // Not inside a frame or an exchange
     EIMSK &= ~SWBB_M7_WAKE_ENABLE; // No re-entry while nested
+    SWBB_FRAME_BEGIN();
     wake_receive();
+    SWBB_FRAME_END();
     last_rise = PJON_MICROS();
     EIFR = SWBB_M7_WAKE_FLAG;
     EIMSK |= SWBB_M7_WAKE_ENABLE;
